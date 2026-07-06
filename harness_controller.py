@@ -8,10 +8,11 @@ Responsibilities:
 - Own the QUndoStack. Every mutation — node moved, a field renamed or
   edited, anything — goes through a QUndoCommand pushed here, so it's
   automatically undoable/redoable.
-- Intercept change signals coming from the scene's graphics items
-  (currently: NodeGraphicsItem.positionChanged). Future signals — a
-  label being edited in place, a property panel editing an edge/wire
-  field — plug into this the same way.
+- Intercept change signals coming from the scene's graphics items.
+  NodeGraphicsItem.moveFinished fires once per completed drag (not once
+  per intermediate mouse-move step), so one drag produces exactly one
+  undo command. Future signals — a label edited in place, a property
+  panel editing an edge/wire field — plug in the same way.
 - The Harness model is the single source of truth. The controller is the
   ONLY thing allowed to mutate it. Graphics items never touch the model
   directly; they only report "this changed" via signals or explicit
@@ -20,9 +21,7 @@ Responsibilities:
   to refresh just the affected item — it never re-renders the whole
   scene for a single edit.
 
-Not yet implemented (comes with the actual CAD move/add/rename UI):
-- Coalescing a mouse-drag's many intermediate itemChange events into a
-  single undo command (drag should commit once, on release).
+Not yet implemented (comes with further CAD UI work):
 - Add/delete commands for nodes, edges, wires.
 - Signals for label-in-place-editing / property-panel edits, though the
   controller methods for committing such edits already exist below
@@ -62,6 +61,21 @@ class MoveNodeCommand(QUndoCommand):
         self.controller._apply_node_position(self.node_id, self.old_pos)
 
 
+class AddWireCommand(QUndoCommand):
+    """Undoable creation of a new Wire."""
+
+    def __init__(self, controller: "HarnessController", wire):
+        super().__init__(f"Add wire {wire.wire_id}")
+        self.controller = controller
+        self.wire = wire
+
+    def redo(self) -> None:
+        self.controller._apply_add_wire(self.wire)
+
+    def undo(self) -> None:
+        self.controller._apply_remove_wire(self.wire.wire_id)
+
+
 class SetFieldCommand(QUndoCommand):
     """Generic undoable set of a single attribute on a model entity
     (Node.label, Edge.length_mm, Wire.color, etc). Covers renaming and
@@ -97,11 +111,16 @@ class HarnessController(QObject):
     # (or anything else, e.g. a future property panel) can react.
     modelChanged = pyqtSignal(str, str)  # (entity_kind, entity_id)
 
-    def __init__(self, harness: Harness, view, main_window: Optional[QObject] = None):
-        super().__init__(main_window)
-        self.main_window = main_window
-        self.harness = harness
+    # Emitted specifically when a wire is added or removed — i.e. the
+    # *set* of wires changed, not just a field on one of them. The Wires
+    # tab listens to this to know when to add/remove a row (modelChanged
+    # alone only tells it a field changed on an existing row).
+    wireListChanged = pyqtSignal()
+
+    def __init__(self, view, parent: Optional[QObject] = None):
+        super().__init__(parent)
         self.view = view
+        self.harness: Optional[Harness] = view.harness
         self.undo_stack = QUndoStack(self)
 
         # Guards against the controller's own model->view writes (e.g. an
@@ -114,7 +133,7 @@ class HarnessController(QObject):
         # Reconnect to the scene's items whenever the view rebuilds them
         # (e.g. on File > Open), and connect now in case items already
         # exist.
-        main_window.sceneRebuilt.connect(self.connect_scene)
+        self.view.sceneRebuilt.connect(self.connect_scene)
         self.connect_scene()
 
     # ---- wiring into the scene ----
@@ -126,25 +145,23 @@ class HarnessController(QObject):
         new file replaces view.harness with a brand new Harness instance,
         so the controller must track that too or it would keep mutating
         (and undo/redo-ing) a discarded model."""
-        self.harness = self.main_window.harness
+        self.harness = self.view.harness
         self.undo_stack.clear()  # old commands would reference a now-discarded document
-        for node_item in self.main_window.node_items.values():
-            node_item.positionChanged.connect(self._on_node_position_changed)
+        for node_item in self.view.node_items.values():
+            node_item.moveFinished.connect(self._on_node_move_finished)
 
     # ---- scene -> model (change interception) ----
 
-    def _on_node_position_changed(self, node_id: str, new_pos: QPointF) -> None:
+    def _on_node_move_finished(self, node_id: str, old_pos: QPointF, new_pos: QPointF) -> None:
         if self._applying:
             return  # this move came from us (undo/redo/apply) — don't re-record it
-        
-        node = self.harness.nodes[node_id]
-        old_pos = tuple(node.position) if node.position is not None else (0.0, 0.0)
-        new_pos_tuple = (round(new_pos.x(),-1), round(new_pos.y(),-1))
-        print(new_pos_tuple)
-        if old_pos[:2] == new_pos_tuple:
+
+        old_pos_tuple = (old_pos.x(), old_pos.y())
+        new_pos_tuple = (new_pos.x(), new_pos.y())
+        if old_pos_tuple == new_pos_tuple:
             return  # no real movement
 
-        self.undo_stack.push(MoveNodeCommand(self, node_id, old_pos, new_pos_tuple))
+        self.undo_stack.push(MoveNodeCommand(self, node_id, old_pos_tuple, new_pos_tuple))
 
     # ---- public API for editors not built yet (rename dialogs, property panels) ----
 
@@ -171,6 +188,11 @@ class HarnessController(QObject):
             return
         self.undo_stack.push(SetFieldCommand(self, "wire", wire_id, field_name, old_value, new_value))
 
+    def add_wire(self, wire) -> None:
+        """Add a brand new Wire (e.g. from the Wires tab's Add Wire dialog).
+        Undoable like everything else."""
+        self.undo_stack.push(AddWireCommand(self, wire))
+
     # ---- undo/redo passthrough ----
 
     def undo(self) -> None:
@@ -193,7 +215,7 @@ class HarnessController(QObject):
 
         self._applying = True
         try:
-            item = self.main_window.node_items.get(node_id)
+            item = self.view.node_items.get(node_id)
             if item is not None:
                 item.setPos(position[0], position[1])
         finally:
@@ -206,6 +228,17 @@ class HarnessController(QObject):
         setattr(entity, field_name, value)
         self.modelChanged.emit(entity_kind, entity_id)
 
+    def _apply_add_wire(self, wire) -> None:
+        self.harness.add_wire(wire)  # Harness.add_wire validates node/edge references
+        self.wireListChanged.emit()
+
+    def _apply_remove_wire(self, wire_id: str) -> None:
+        del self.harness.wires[wire_id]
+        # Clean up any stale highlight for a wire that no longer exists.
+        self.view.highlighted_wire_ids.discard(wire_id)
+        self.view._apply_highlights()
+        self.wireListChanged.emit()
+
     def _get_entity(self, entity_kind: str, entity_id: str):
         table = {
             "node": self.harness.nodes,
@@ -217,4 +250,4 @@ class HarnessController(QObject):
     # ---- model -> view (targeted refresh, never a full re-render) ----
 
     def _on_model_changed(self, entity_kind: str, entity_id: str) -> None:
-        self.main_window.refresh_entity(entity_kind, entity_id)
+        self.view.refresh_entity(entity_kind, entity_id)

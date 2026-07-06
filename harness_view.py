@@ -1,70 +1,68 @@
 """
 harness_view.py
 
-Read-only-layout PyQt5 viewer for a Harness (see harness_model.py).
+The canvas: a QGraphicsView widget that renders a Harness (see
+harness_model.py), plus the QGraphicsItem subclasses it draws.
 
-Scope for this stage (deliberately minimal, per spec):
-- Load a Harness from JSON and render it.
-- Save the currently loaded Harness back to JSON.
-- Nodes are drawn as circles (connector) or polygons (splice / inline joint).
-- Edges are drawn as lines between their start/end node positions.
-- NO creation, deletion, or moving of items yet — ItemIsMovable is off,
-  and there is no "add node/edge/wire" UI.
+This file is deliberately "dumb" about application chrome — no menu bar,
+no toolbar, no dialogs. That all now lives in main_window.py. This class
+only knows how to load/hold/save a Harness and draw it.
 
-Architecture (this revision):
-- NodeGraphicsItem and EdgeGraphicsItem are real QGraphicsItem subclasses,
-  not thin wrapper objects around native shape items. This is the standard
-  Qt pattern for CAD-style tools: custom paint()/boundingRect()/shape(),
-  the domain object (Node/Edge) attached directly on the item, and
-  itemChange() hooks that will matter once dragging is added.
-- NodeGraphicsItem draws itself in local coordinates centered on (0, 0)
-  and is placed in the scene via setPos(x, y). This means a future "move"
-  feature only has to change .pos() — no shape recomputation needed.
-- NodeGraphicsItem keeps a list of the EdgeGraphicsItems attached to it.
-  On ItemPositionHasChanged it tells each attached edge to redraw. Movement
-  is disabled for now, but the wiring is already in place for later.
+Scope for this stage:
+- Load a Harness from JSON and render it; save it back to JSON.
+- Nodes: circle (connector) / hexagon (splice) / diamond (inline joint).
+- Edges: lines between their start/end node positions.
+- Nodes can now be dragged (ItemIsMovable is on), snapped to a 10-unit
+  grid while dragging. Still NO add/delete UI.
+
+Architecture:
+- NodeGraphicsItem / EdgeGraphicsItem are QGraphicsObject subclasses (see
+  harness_controller.py for how their signals get intercepted).
+- NodeGraphicsItem snaps its own position to a 10-unit grid via
+  itemChange(ItemPositionChange) — this runs on every intermediate step
+  of a drag, not just the end, so the item visually snaps as you drag it.
+- NodeGraphicsItem emits moveFinished(node_id, old_pos, new_pos) only
+  once, when the drag ends (mouseReleaseEvent) — this is the point the
+  controller turns into a single undo command, instead of one command
+  per intermediate mouse-move step.
 - EdgeGraphicsItem holds references to its two NodeGraphicsItem endpoints
-  (not raw coordinates) and recomputes its line from their live .pos().
-- The label is a child QGraphicsTextItem (setParentItem), so it moves and
-  selects together with its shape automatically.
+  and recomputes its line whenever either one moves (via a direct call
+  from NodeGraphicsItem.itemChange, not a signal — this is a purely
+  visual sync, not a model change, so it doesn't go through the
+  controller).
 
 Layout:
-- If a Node has an explicit `position` (x, y[, z]) it is used as-is
-  (x, y become scene coordinates; z is ignored for this 2D view).
-- If a Node has no position, it is auto-placed on a simple grid so the
-  file can still be visualized. This auto layout is NOT written back to
-  the JSON on save — save serializes the original Harness model, whose
-  Node.position was never touched.
-
-Run:
-    python3 harness_view.py [optional_path_to_harness.json]
+- If a Node has an explicit `position` (x, y[, z]) it is used as-is.
+- If a Node has no position, it's auto-placed on a simple grid so the
+  file can still be visualized. This fallback is never written back to
+  the model — save always serializes Node.position as last set.
 """
 
 from __future__ import annotations
 
-import sys
 import math
 from typing import Optional
 
 from PyQt5.QtWidgets import (
-    QApplication, QMainWindow, QGraphicsView, QGraphicsScene,
-    QGraphicsItem, QGraphicsObject, QGraphicsTextItem,
-    QFileDialog, QAction, QMessageBox, QStatusBar, QStyleOptionGraphicsItem, QWidget,
+    QGraphicsView, QGraphicsScene,
+    QGraphicsItem, QGraphicsObject, QGraphicsTextItem, QWidget, QStyleOptionGraphicsItem,
 )
 from PyQt5.QtGui import QBrush, QPen, QColor, QPolygonF, QPainter, QPainterPath
 from PyQt5.QtCore import Qt, QPointF, QRectF, pyqtSignal
 
-from harness_model import Harness, Node, Edge, Wire, NodeType
-from harness_controller import HarnessController
+from harness_model import Harness, Node, Edge, NodeType
+
 
 # --------------------------------------------------------------------------
 # Visual constants
 # --------------------------------------------------------------------------
 
 NODE_RADIUS = 18          # px, for connector circles / bounding size for polygons
-GRID_SPACING_X = 140
+GRID_SPACING_X = 140      # fallback auto-layout spacing (nodes with no saved position)
 GRID_SPACING_Y = 120
 GRID_COLUMNS = 6
+
+DRAG_SNAP = 10            # nodes snap to this grid size (scene units) while dragging
 
 NODE_COLORS = {
     NodeType.CONNECTOR: QColor("#3B82F6"),     # blue
@@ -88,6 +86,10 @@ def _regular_polygon(radius: float, sides: int, rotation_deg: float = -90) -> QP
     return poly
 
 
+def _snap(value: float, step: float = DRAG_SNAP) -> float:
+    return round(value / step) * step
+
+
 # --------------------------------------------------------------------------
 # NodeGraphicsItem — connector (circle) / splice (hexagon) / inline joint (diamond)
 # --------------------------------------------------------------------------
@@ -96,19 +98,21 @@ class NodeGraphicsItem(QGraphicsObject):
     """A single Node (connector / splice / inline joint), drawn in local
     coordinates around (0, 0) and positioned in the scene via setPos().
 
-    Subclasses QGraphicsObject (QObject + QGraphicsItem) rather than plain
-    QGraphicsItem so it can emit Qt signals. This is how the controller
-    intercepts scene changes: it doesn't poll or subclass the scene, it
-    just connects to positionChanged (and future signals like
-    labelEdited) on every item."""
+    Subclasses QGraphicsObject (QObject + QGraphicsItem) so it can emit
+    Qt signals — that's how the controller intercepts scene changes
+    without polling or subclassing the scene itself."""
 
-    positionChanged = pyqtSignal(str, QPointF)  # (node_id, new_scene_pos)
+    # Emitted once per completed drag: (node_id, old_scene_pos, new_scene_pos).
+    # NOT emitted on every intermediate mouse-move step, so one drag
+    # produces exactly one undo command.
+    moveFinished = pyqtSignal(str, QPointF, QPointF)
 
     def __init__(self, node: Node, radius: float = NODE_RADIUS, parent: Optional[QGraphicsItem] = None):
         super().__init__(parent)
         self.node = node
         self.radius = radius
         self.edges: list["EdgeGraphicsItem"] = []  # edges attached to this node
+        self._press_pos: Optional[QPointF] = None  # position at the start of the current drag
 
         self._polygon: Optional[QPolygonF] = None  # None => draw as ellipse
         if node.node_type == NodeType.SPLICE:
@@ -119,8 +123,8 @@ class NodeGraphicsItem(QGraphicsObject):
 
         self.setToolTip(self._tooltip())
         self.setFlag(QGraphicsItem.ItemIsSelectable, True)
-        self.setFlag(QGraphicsItem.ItemIsMovable, True)          # not yet — CAD move comes later
-        self.setFlag(QGraphicsItem.ItemSendsGeometryChanges, True)  # needed so itemChange fires on setPos
+        self.setFlag(QGraphicsItem.ItemIsMovable, True)
+        self.setFlag(QGraphicsItem.ItemSendsGeometryChanges, True)  # needed for itemChange to fire
 
         self.label_item = QGraphicsTextItem(node.label or node.node_id, self)
         self.label_item.setDefaultTextColor(LABEL_COLOR)
@@ -158,18 +162,35 @@ class NodeGraphicsItem(QGraphicsObject):
             painter.drawEllipse(QPointF(0, 0), self.radius, self.radius)
 
     def itemChange(self, change, value):
+        if change == QGraphicsItem.ItemPositionChange:
+            # value is the proposed new position — snap it to the grid.
+            # This runs on every intermediate step of a drag, so the item
+            # visibly snaps as it moves, not just when released.
+            return QPointF(_snap(value.x()), _snap(value.y()))
+
         if change == QGraphicsItem.ItemPositionHasChanged:
             for edge_item in self.edges:
                 edge_item.update_line()
-            # Notify anyone listening (the controller) that this node moved.
-            # NOTE: while ItemIsMovable is False this only fires from
-            # programmatic setPos() calls (e.g. the controller applying an
-            # undo/redo). Once dragging is enabled, a real mouse drag fires
-            # this on every intermediate step — at that point the commit
-            # point should likely move to mouseReleaseEvent instead of
-            # here, so a single drag produces a single undo entry.
-            self.positionChanged.emit(self.node.node_id, self.pos())
+
         return super().itemChange(change, value)
+
+    def mousePressEvent(self, event) -> None:
+        self._press_pos = QPointF(self.pos())
+        super().mousePressEvent(event)
+
+    def mouseReleaseEvent(self, event) -> None:
+        super().mouseReleaseEvent(event)
+        self._finish_drag()
+
+    def _finish_drag(self) -> None:
+        """Factored out of mouseReleaseEvent so it can also be called
+        directly (e.g. in tests) without a real QGraphicsSceneMouseEvent."""
+        if self._press_pos is None:
+            return
+        old_pos, new_pos = self._press_pos, QPointF(self.pos())
+        self._press_pos = None
+        if old_pos != new_pos:
+            self.moveFinished.emit(self.node.node_id, old_pos, new_pos)
 
     def refresh_from_model(self) -> None:
         """Re-sync this item's visuals from self.node after the controller
@@ -192,7 +213,7 @@ class NodeGraphicsItem(QGraphicsObject):
 class EdgeGraphicsItem(QGraphicsItem):
     """A single Edge, drawn as a line between two NodeGraphicsItem endpoints.
     Tracks the endpoint items (not static coordinates) so it can redraw
-    itself if either node ever moves."""
+    itself whenever either node moves."""
 
     def __init__(self, edge: Edge, start_item: NodeGraphicsItem, end_item: NodeGraphicsItem,
                  parent: Optional[QGraphicsItem] = None):
@@ -202,6 +223,7 @@ class EdgeGraphicsItem(QGraphicsItem):
         self.end_item = end_item
         self._line_start = QPointF(start_item.pos())
         self._line_end = QPointF(end_item.pos())
+        self._highlighted = False  # true when a highlighted wire's route passes through this edge
 
         self.setToolTip(self._tooltip())
         self.setZValue(-1)  # draw behind nodes
@@ -209,6 +231,11 @@ class EdgeGraphicsItem(QGraphicsItem):
 
         start_item.register_edge(self)
         end_item.register_edge(self)
+
+    def set_highlighted(self, on: bool) -> None:
+        if on != self._highlighted:
+            self._highlighted = on
+            self.update()
 
     def update_line(self) -> None:
         """Recompute the line from the live positions of the endpoint nodes."""
@@ -223,8 +250,7 @@ class EdgeGraphicsItem(QGraphicsItem):
 
     def shape(self) -> QPainterPath:
         stroker_path = QPainterPath()
-        # Give the line some hit-test width so it's easy to click/select.
-        stroker_path.addPolygon(self._widen_line(width=6.0))
+        stroker_path.addPolygon(self._widen_line(width=6.0))  # easier to click than the bare line
         return stroker_path
 
     def _widen_line(self, width: float) -> QPolygonF:
@@ -240,7 +266,12 @@ class EdgeGraphicsItem(QGraphicsItem):
         ])
 
     def paint(self, painter, option: QStyleOptionGraphicsItem, widget: Optional[QWidget] = None) -> None:
-        pen = QPen(QColor("#EF4444"), EDGE_PEN.widthF()) if self.isSelected() else EDGE_PEN
+        if self._highlighted:
+            pen = QPen(QColor("#FBBF24"), EDGE_PEN.widthF() + 2)  # amber, thicker
+        elif self.isSelected():
+            pen = QPen(QColor("#EF4444"), EDGE_PEN.widthF())
+        else:
+            pen = EDGE_PEN
         painter.setPen(pen)
         painter.drawLine(self._line_start, self._line_end)
 
@@ -258,113 +289,46 @@ class EdgeGraphicsItem(QGraphicsItem):
 
 
 # --------------------------------------------------------------------------
-# Main window
+# HarnessGraphicsView — the canvas widget
 # --------------------------------------------------------------------------
 
-class HarnessView(QMainWindow):
-    # Emitted after _render() rebuilds the scene from scratch (e.g. a fresh
-    # Open), since that discards the old graphics items. The controller
-    # listens to this so it can reconnect to the newly created items.
+class HarnessGraphicsView(QGraphicsView):
+    """A QGraphicsView that renders a Harness. Owns the scene and all
+    graphics items; knows nothing about menus, toolbars, or dialogs —
+    that's main_window.py's job."""
+
+    # Emitted after render() rebuilds the scene from scratch (e.g. a fresh
+    # load_json), since that discards the old graphics items. The
+    # controller listens to this so it can reconnect to the new items.
     sceneRebuilt = pyqtSignal()
 
-    def __init__(self, initial_path: Optional[str] = None):
-        super().__init__()
-        
-        self.setWindowTitle("Harness Viewer")
-        self.resize(1000, 700)
+    def __init__(self, parent: Optional[QWidget] = None):
+        super().__init__(parent)
 
-        
         self.harness: Optional[Harness] = None
         self.current_path: Optional[str] = None
         self.node_items: dict[str, NodeGraphicsItem] = {}
         self.edge_items: dict[str, EdgeGraphicsItem] = {}
+        self.highlighted_wire_ids: set[str] = set()  # wires currently toggled "on" in the Wires tab
 
         self.scene = QGraphicsScene(self)
-        self.view = QGraphicsView(self.scene, self)
-        self.view.setRenderHint(QPainter.Antialiasing)
-        self.view.setDragMode(QGraphicsView.ScrollHandDrag)
-        self.setCentralWidget(self.view)
+        self.setScene(self.scene)
+        self.setRenderHint(QPainter.Antialiasing)
+        self.setDragMode(QGraphicsView.RubberBandDrag)  # click-drag on empty space = select; on a node = move it
 
-        self.status_bar = QStatusBar(self)
-        self.setStatusBar(self.status_bar)
-
-        self._build_menu()
-        
-        if initial_path:
-            self.load_json(initial_path)
-
-    # ---- menu ----
-
-    def _build_menu(self) -> None:
-        menu = self.menuBar().addMenu("&File")
-
-        open_action = QAction("&Open JSON...", self)
-        open_action.setShortcut("Ctrl+O")
-        open_action.triggered.connect(self.on_open)
-        menu.addAction(open_action)
-
-        save_action = QAction("&Save JSON", self)
-        save_action.setShortcut("Ctrl+S")
-        save_action.triggered.connect(self.on_save)
-        menu.addAction(save_action)
-
-        save_as_action = QAction("Save JSON &As...", self)
-        save_as_action.setShortcut("Ctrl+Shift+S")
-        save_as_action.triggered.connect(self.on_save_as)
-        menu.addAction(save_as_action)
-
-    # ---- file actions ----
-
-    def on_open(self) -> None:
-        path, _ = QFileDialog.getOpenFileName(self, "Open Harness JSON", "", "JSON Files (*.json)")
-        if path:
-            self.load_json(path)
-
-    def on_save(self) -> None:
-        if self.harness is None:
-            return
-        if self.current_path is None:
-            self.on_save_as()
-            return
-        self.save_json(self.current_path)
-
-    def on_save_as(self) -> None:
-        if self.harness is None:
-            return
-        path, _ = QFileDialog.getSaveFileName(self, "Save Harness JSON", "", "JSON Files (*.json)")
-        if path:
-            self.save_json(path)
-
-    # ---- core load/save ----
+    # ---- load / save (no dialogs, no message boxes — that's main_window's job) ----
 
     def load_json(self, path: str) -> None:
-        try:
-            harness = Harness.load_json(path)
-        except Exception as exc:
-            QMessageBox.critical(self, "Load failed", f"Could not load '{path}':\n{exc}")
-            return
-
+        harness = Harness.load_json(path)  # let exceptions propagate to the caller
         self.harness = harness
         self.current_path = path
-        self.controller = HarnessController(self.harness,self.view,self)
-        self._render()
-        self.status_bar.showMessage(
-            f"Loaded '{path}': {len(harness.nodes)} nodes, "
-            f"{len(harness.edges)} edges, {len(harness.wires)} wires"
-        )
-        self.setWindowTitle(f"Harness Viewer — {path}")
+        self.render()
 
     def save_json(self, path: str) -> None:
         if self.harness is None:
-            return
-        try:
-            self.harness.save_json(path)
-        except Exception as exc:
-            QMessageBox.critical(self, "Save failed", f"Could not save '{path}':\n{exc}")
-            return
+            raise ValueError("No harness loaded to save")
+        self.harness.save_json(path)
         self.current_path = path
-        self.status_bar.showMessage(f"Saved '{path}'")
-        self.setWindowTitle(f"Harness Viewer — {path}")
 
     # ---- rendering ----
 
@@ -384,10 +348,11 @@ class HarnessView(QMainWindow):
                 grid_index += 1
         return positions
 
-    def _render(self) -> None:
+    def render(self) -> None:
         self.scene.clear()
         self.node_items.clear()
         self.edge_items.clear()
+        self.highlighted_wire_ids.clear()  # a freshly loaded document starts with nothing highlighted
         if self.harness is None:
             return
 
@@ -411,7 +376,7 @@ class HarnessView(QMainWindow):
             self.edge_items[edge.edge_id] = edge_item
 
         self.scene.setSceneRect(self.scene.itemsBoundingRect().adjusted(-40, -40, 40, 40))
-        self.view.fitInView(self.scene.sceneRect(), Qt.KeepAspectRatio)
+        self.fitInView(self.scene.sceneRect(), Qt.KeepAspectRatio)
 
         self.sceneRebuilt.emit()
 
@@ -432,18 +397,25 @@ class HarnessView(QMainWindow):
         elif entity_kind == "wire":
             pass  # wires aren't drawn yet — nothing to refresh visually
 
+    # ---- wire highlighting (driven by the Wires tab) ----
 
-# --------------------------------------------------------------------------
-# Entry point
-# --------------------------------------------------------------------------
+    def set_wire_highlighted(self, wire_id: str, on: bool) -> None:
+        """Toggle whether a wire's route is lit up on the canvas. Multiple
+        wires can be highlighted at once."""
+        if on:
+            self.highlighted_wire_ids.add(wire_id)
+        else:
+            self.highlighted_wire_ids.discard(wire_id)
+        self._apply_highlights()
 
-def main():
-    app = QApplication(sys.argv)
-    initial_path = sys.argv[1] if len(sys.argv) > 1 else None
-    window = HarnessView(initial_path)
-    window.show()
-    sys.exit(app.exec_())
+    def _apply_highlights(self) -> None:
+        if self.harness is None:
+            return
+        highlighted_edge_ids: set[str] = set()
+        for wire_id in self.highlighted_wire_ids:
+            wire = self.harness.wires.get(wire_id)
+            if wire is not None:
+                highlighted_edge_ids.update(wire.route_edge_ids)
 
-
-if __name__ == "__main__":
-    main()
+        for edge_id, edge_item in self.edge_items.items():
+            edge_item.set_highlighted(edge_id in highlighted_edge_ids)
