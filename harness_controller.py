@@ -8,10 +8,11 @@ Responsibilities:
 - Own the QUndoStack. Every mutation — node moved, a field renamed or
   edited, anything — goes through a QUndoCommand pushed here, so it's
   automatically undoable/redoable.
-- Intercept change signals coming from the scene's graphics items
-  (currently: NodeGraphicsItem.positionChanged). Future signals — a
-  label being edited in place, a property panel editing an edge/wire
-  field — plug into this the same way.
+- Intercept change signals coming from the scene's graphics items.
+  NodeGraphicsItem.moveFinished fires once per completed drag (not once
+  per intermediate mouse-move step), so one drag produces exactly one
+  undo command. Future signals — a label edited in place, a property
+  panel editing an edge/wire field — plug in the same way.
 - The Harness model is the single source of truth. The controller is the
   ONLY thing allowed to mutate it. Graphics items never touch the model
   directly; they only report "this changed" via signals or explicit
@@ -20,9 +21,7 @@ Responsibilities:
   to refresh just the affected item — it never re-renders the whole
   scene for a single edit.
 
-Not yet implemented (comes with the actual CAD move/add/rename UI):
-- Coalescing a mouse-drag's many intermediate itemChange events into a
-  single undo command (drag should commit once, on release).
+Not yet implemented (comes with further CAD UI work):
 - Add/delete commands for nodes, edges, wires.
 - Signals for label-in-place-editing / property-panel edits, though the
   controller methods for committing such edits already exist below
@@ -97,10 +96,8 @@ class HarnessController(QObject):
     # (or anything else, e.g. a future property panel) can react.
     modelChanged = pyqtSignal(str, str)  # (entity_kind, entity_id)
 
-    def __init__(self, harness: Harness, view, main_window: Optional[QObject] = None):
-        super().__init__(main_window)
-        self.main_window = main_window
-        self.harness = harness
+    def __init__(self, view, parent: Optional[QObject] = None):
+        super().__init__(parent)
         self.view = view
         self.undo_stack = QUndoStack(self)
 
@@ -114,7 +111,7 @@ class HarnessController(QObject):
         # Reconnect to the scene's items whenever the view rebuilds them
         # (e.g. on File > Open), and connect now in case items already
         # exist.
-        main_window.sceneRebuilt.connect(self.connect_scene)
+        self.view.sceneRebuilt.connect(self.connect_scene)
         self.connect_scene()
 
     # ---- wiring into the scene ----
@@ -126,30 +123,27 @@ class HarnessController(QObject):
         new file replaces view.harness with a brand new Harness instance,
         so the controller must track that too or it would keep mutating
         (and undo/redo-ing) a discarded model."""
-        self.harness = self.main_window.harness
         self.undo_stack.clear()  # old commands would reference a now-discarded document
-        for node_item in self.main_window.node_items.values():
-            node_item.positionChanged.connect(self._on_node_position_changed)
+        for node_item in self.view.node_items.values():
+            node_item.moveFinished.connect(self._on_node_move_finished)
 
     # ---- scene -> model (change interception) ----
 
-    def _on_node_position_changed(self, node_id: str, new_pos: QPointF) -> None:
+    def _on_node_move_finished(self, node_id: str, old_pos: QPointF, new_pos: QPointF) -> None:
         if self._applying:
             return  # this move came from us (undo/redo/apply) — don't re-record it
-        
-        node = self.harness.nodes[node_id]
-        old_pos = tuple(node.position) if node.position is not None else (0.0, 0.0)
-        new_pos_tuple = (round(new_pos.x(),-1), round(new_pos.y(),-1))
-        print(new_pos_tuple)
-        if old_pos[:2] == new_pos_tuple:
+
+        old_pos_tuple = (old_pos.x(), old_pos.y())
+        new_pos_tuple = (new_pos.x(), new_pos.y())
+        if old_pos_tuple == new_pos_tuple:
             return  # no real movement
 
-        self.undo_stack.push(MoveNodeCommand(self, node_id, old_pos, new_pos_tuple))
+        self.undo_stack.push(MoveNodeCommand(self, node_id, old_pos_tuple, new_pos_tuple))
 
     # ---- public API for editors not built yet (rename dialogs, property panels) ----
 
     def set_node_label(self, node_id: str, new_label: str) -> None:
-        node = self.harness.nodes[node_id]
+        node = self.view.harness.nodes[node_id]
         if node.label == new_label:
             return
         self.undo_stack.push(SetFieldCommand(
@@ -158,14 +152,14 @@ class HarnessController(QObject):
         ))
 
     def set_edge_field(self, edge_id: str, field_name: str, new_value: Any) -> None:
-        edge = self.harness.edges[edge_id]
+        edge = self.view.harness.edges[edge_id]
         old_value = getattr(edge, field_name)
         if old_value == new_value:
             return
         self.undo_stack.push(SetFieldCommand(self, "edge", edge_id, field_name, old_value, new_value))
 
     def set_wire_field(self, wire_id: str, field_name: str, new_value: Any) -> None:
-        wire = self.harness.wires[wire_id]
+        wire = self.view.harness.wires[wire_id]
         old_value = getattr(wire, field_name)
         if old_value == new_value:
             return
@@ -188,12 +182,12 @@ class HarnessController(QObject):
     # ---- command application: the ONLY place that mutates the model ----
 
     def _apply_node_position(self, node_id: str, position: tuple) -> None:
-        node = self.harness.nodes[node_id]
+        node = self.view.harness.nodes[node_id]
         node.position = position
 
         self._applying = True
         try:
-            item = self.main_window.node_items.get(node_id)
+            item = self.view.node_items.get(node_id)
             if item is not None:
                 item.setPos(position[0], position[1])
         finally:
@@ -208,13 +202,13 @@ class HarnessController(QObject):
 
     def _get_entity(self, entity_kind: str, entity_id: str):
         table = {
-            "node": self.harness.nodes,
-            "edge": self.harness.edges,
-            "wire": self.harness.wires,
+            "node": self.view.harness.nodes,
+            "edge": self.view.harness.edges,
+            "wire": self.view.harness.wires,
         }[entity_kind]
         return table[entity_id]
 
     # ---- model -> view (targeted refresh, never a full re-render) ----
 
     def _on_model_changed(self, entity_kind: str, entity_id: str) -> None:
-        self.main_window.refresh_entity(entity_kind, entity_id)
+        self.view.refresh_entity(entity_kind, entity_id)
