@@ -1,0 +1,255 @@
+{
+  "harness_id": "754",
+  "name": "Grammer",
+  "nodes": [
+    {
+      "node_id": "STVB 01",
+      "node_type": "connector",
+      "label": "STVB 01",
+      "position": [
+        -30.0,
+        -150.0
+      ],
+      "metadata": {}
+    },
+    {
+      "node_id": "STVB 02",
+      "node_type": "connector",
+      "label": "STVB 02",
+      "position": [
+        -50.0,
+        -100.0
+      ],
+      "metadata": {}
+    },
+    {
+      "node_id": "STVB 03",
+      "node_type": "connector",
+      "label": "STVB 03",
+      "position": [
+        -30.0,
+        -60.0
+      ],
+      "metadata": {}
+    },
+    {
+      "node_id": "STVB 04",
+      "node_type": "connector",
+      "label": "STVB 04",
+      "position": [
+        270.0,
+        -110.0
+      ],
+      "metadata": {}
+    },
+    {
+      "node_id": "STVB 05",
+      "node_type": "connector",
+      "label": "STVB 05",
+      "position": [
+        260.0,
+        -70.0
+      ],
+      "metadata": {}
+    },
+    {
+      "node_id": "STVBF 01",
+      "node_type": "inline_joint",
+      "label": "STVBF 01",
+      "position": [
+        180.0,
+        30.0
+      ],
+      "metadata": {}
+    },
+    {
+      "node_id": "SPLICE_1",
+      "node_type": "splice",
+      "label": "Inline Joint",
+      "position": [
+        90.0,
+        -140.0
+      ],
+      "metadata": {}
+    }
+  ],
+  "edges": [
+    {
+      "edge_id": "SEG_1",
+      "start_node_id": "STVB 01",
+      "end_node_id": "SPLICE_1",
+      "length_mm": 100.0,
+      "max_diameter_mm": 8.5,
+      "bend_radius_mm": 25.0,
+      "metadata": {}
+    },
+    {
+      "edge_id": "SEG_2",
+      "start_node_id": "SPLICE_1",
+      "end_node_id": "STVBF 01",
+      "length_mm": 220.0,
+      "max_diameter_mm": 6.0,
+      "bend_radius_mm": 18.0,
+      "metadata": {}
+    },
+    {
+      "edge_id": "SEG_AUTO_1",
+      "start_node_id": "STVB 02",
+      "end_node_id": "SPLICE_1",
+      "length_mm": 114.0175425099138,
+      "max_diameter_mm": 0.0,
+      "bend_radius_mm": 0.0,
+      "metadata": {
+        "auto_generated": true,
+        "direct": true
+      }
+    },
+    {
+      "edge_id": "SEG_AUTO_2",
+      "start_node_id": "STVB 03",
+      "end_node_id": "STVB 04",
+      "length_mm": 290.68883707497264,
+      "max_diameter_mm": 0.0,
+      "bend_radius_mm": 0.0,
+      "metadata": {
+        "auto_generated": true,
+        "direct": true
+      }
+    },
+    {
+      "edge_id": "SEG_AUTO_3",
+      "start_node_id": "STVB 05",
+      "end_node_id": "SPLICE_1",
+      "length_mm": 268.70057685088807,
+      "max_diameter_mm": 0.0,
+      "bend_radius_mm": 0.0,
+      "metadata": {
+        "auto_generated": true,
+        "direct": true
+      }
+    }
+  ],
+  "wires": [
+    {
+      "wire_id": "LP001 BN",
+      "gauge_mm2": 0.75,
+      "color": "brown",
+      "from_node_id": "STVBF 01",
+      "from_pin": "1",
+      "to_node_id": "SPLICE_1",
+      "to_pin": "1",
+      "route_edge_ids": [
+        "SEG_2"
+      ],
+      "metadata": {}
+    },
+    {
+      "wire_id": "LS003 GN",
+      "gauge_mm2": 0.75,
+      "color": "#00ff00",
+      "from_node_id": "STVBF 01",
+      "from_pin": "3",
+      "to_node_id": "STVB 01",
+      "to_pin": "5",
+      "route_edge_ids": [
+        "SEG_2",
+        "SEG_1"
+      ],
+      "metadata": {}
+    },
+    {
+      "wire_id": "LP002 RD",
+      "gauge_mm2": 0.75,
+      "color": "red",
+      "from_node_id": "STVBF 01",
+      "from_pin": "2",
+      "to_node_id": "SPLICE_1",
+      "to_pin": "2",
+      "route_edge_ids": [
+        "SEG_2"
+      ],
+      "metadata": {}
+    },
+    {
+      "wire_id": "LS004 YE",
+      "gauge_mm2": 0.75,
+      "color": "yellow",
+      "from_node_id": "STVBF 01",
+      "from_pin": "4",
+      "to_node_id": "STVB 01",
+      "to_pin": "7",
+      "route_edge_ids": [
+        "SEG_2",
+        "SEG_1"
+      ],
+      "metadata": {}
+    },
+    {
+      "wire_id": "LS005 GY",
+      "gauge_mm2": 0.75,
+      "color": "gray",
+      "from_node_id": "STVBF 01",
+      "from_pin": "5",
+      "to_node_id": "STVB 01",
+      "to_pin": "1",
+      "route_edge_ids": [
+        "SEG_2",
+        "SEG_1"
+      ],
+      "metadata": {}
+    },
+    {
+      "wire_id": "LS006 BU",
+      "gauge_mm2": 0.75,
+      "color": "blue",
+      "from_node_id": "STVBF 01",
+      "from_pin": "7",
+      "to_node_id": "STVB 01",
+      "to_pin": "2",
+      "route_edge_ids": [
+        "SEG_2",
+        "SEG_1"
+      ],
+      "metadata": {}
+    },
+    {
+      "wire_id": "LP007 RD",
+      "gauge_mm2": 0.75,
+      "color": "red",
+      "from_node_id": "STVB 02",
+      "from_pin": "1",
+      "to_node_id": "SPLICE_1",
+      "to_pin": "2",
+      "route_edge_ids": [
+        "SEG_AUTO_1"
+      ],
+      "metadata": {}
+    },
+    {
+      "wire_id": "LP008 BU",
+      "gauge_mm2": 0.75,
+      "color": "blue",
+      "from_node_id": "STVB 03",
+      "from_pin": "1",
+      "to_node_id": "STVB 04",
+      "to_pin": "1",
+      "route_edge_ids": [
+        "SEG_AUTO_2"
+      ],
+      "metadata": {}
+    },
+    {
+      "wire_id": "LP009 BN",
+      "gauge_mm2": 0.75,
+      "color": "brown",
+      "from_node_id": "STVB 05",
+      "from_pin": "1",
+      "to_node_id": "SPLICE_1",
+      "to_pin": "1",
+      "route_edge_ids": [
+        "SEG_AUTO_3"
+      ],
+      "metadata": {}
+    }
+  ]
+}

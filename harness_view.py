@@ -136,6 +136,10 @@ class NodeGraphicsItem(QGraphicsObject):
     def register_edge(self, edge_item: "EdgeGraphicsItem") -> None:
         self.edges.append(edge_item)
 
+    def unregister_edge(self, edge_item: "EdgeGraphicsItem") -> None:
+        if edge_item in self.edges:
+            self.edges.remove(edge_item)
+
     # ---- QGraphicsItem overrides ----
 
     def boundingRect(self) -> QRectF:
@@ -419,3 +423,24 @@ class HarnessGraphicsView(QGraphicsView):
 
         for edge_id, edge_item in self.edge_items.items():
             edge_item.set_highlighted(edge_id in highlighted_edge_ids)
+
+    # ---- incremental edge add/remove (used by the controller's Dijkstra
+    # auto-routing fallback — creating a direct edge shouldn't require a
+    # full scene rebuild) ----
+
+    def add_edge_item(self, edge: Edge) -> None:
+        start_item = self.node_items.get(edge.start_node_id)
+        end_item = self.node_items.get(edge.end_node_id)
+        if start_item is None or end_item is None:
+            raise ValueError(f"Cannot add edge '{edge.edge_id}': endpoint node(s) not in the scene")
+        edge_item = EdgeGraphicsItem(edge, start_item, end_item)
+        self.scene.addItem(edge_item)
+        self.edge_items[edge.edge_id] = edge_item
+
+    def remove_edge_item(self, edge_id: str) -> None:
+        edge_item = self.edge_items.pop(edge_id, None)
+        if edge_item is None:
+            return
+        edge_item.start_item.unregister_edge(edge_item)
+        edge_item.end_item.unregister_edge(edge_item)
+        self.scene.removeItem(edge_item)

@@ -36,7 +36,8 @@ from typing import Any, Optional
 from PyQt5.QtCore import QObject, QPointF, pyqtSignal
 from PyQt5.QtWidgets import QUndoCommand, QUndoStack
 
-from harness_model import Harness
+from harness_model import Harness, Edge, Wire
+from harness_routing import find_route, estimate_direct_length
 
 
 # --------------------------------------------------------------------------
@@ -59,6 +60,22 @@ class MoveNodeCommand(QUndoCommand):
 
     def undo(self) -> None:
         self.controller._apply_node_position(self.node_id, self.old_pos)
+
+
+class AddEdgeCommand(QUndoCommand):
+    """Undoable creation of a new Edge (used for the direct-segment
+    fallback when Dijkstra routing finds no existing path)."""
+
+    def __init__(self, controller: "HarnessController", edge: Edge):
+        super().__init__(f"Add edge {edge.edge_id}")
+        self.controller = controller
+        self.edge = edge
+
+    def redo(self) -> None:
+        self.controller._apply_add_edge(self.edge)
+
+    def undo(self) -> None:
+        self.controller._apply_remove_edge(self.edge.edge_id)
 
 
 class AddWireCommand(QUndoCommand):
@@ -116,6 +133,10 @@ class HarnessController(QObject):
     # tab listens to this to know when to add/remove a row (modelChanged
     # alone only tells it a field changed on an existing row).
     wireListChanged = pyqtSignal()
+
+    # Same idea, for edges — fires when Dijkstra routing has to fall back
+    # to creating a brand new direct edge.
+    edgeListChanged = pyqtSignal()
 
     def __init__(self, view, parent: Optional[QObject] = None):
         super().__init__(parent)
@@ -193,6 +214,35 @@ class HarnessController(QObject):
         Undoable like everything else."""
         self.undo_stack.push(AddWireCommand(self, wire))
 
+    def add_wire_auto_route(self, wire: Wire) -> None:
+        """Add a new wire, assigning its route via Dijkstra over the
+        existing edges. If the from/to nodes aren't connected by any
+        existing chain of edges, a direct edge between them is created
+        first. Both steps (the edge creation, if any, and the wire
+        creation) undo together as a single step."""
+        route, new_edge = self._compute_route_or_direct_edge(wire.from_node_id, wire.to_node_id)
+        self.undo_stack.beginMacro(f"Add wire {wire.wire_id} (auto-route)")
+        if new_edge is not None:
+            self.undo_stack.push(AddEdgeCommand(self, new_edge))
+        wire.route_edge_ids = route
+        self.undo_stack.push(AddWireCommand(self, wire))
+        self.undo_stack.endMacro()
+
+    def auto_route_wire(self, wire_id: str) -> None:
+        """Re-run Dijkstra routing for an existing wire (e.g. the
+        per-row 'Auto-Route' button in the Wires tab). Same direct-edge
+        fallback as add_wire_auto_route."""
+        wire = self.harness.wires[wire_id]
+        old_route = list(wire.route_edge_ids)
+        route, new_edge = self._compute_route_or_direct_edge(wire.from_node_id, wire.to_node_id)
+
+        self.undo_stack.beginMacro(f"Auto-route {wire_id}")
+        if new_edge is not None:
+            self.undo_stack.push(AddEdgeCommand(self, new_edge))
+        if route != old_route:
+            self.undo_stack.push(SetFieldCommand(self, "wire", wire_id, "route_edge_ids", old_route, route))
+        self.undo_stack.endMacro()
+
     # ---- undo/redo passthrough ----
 
     def undo(self) -> None:
@@ -206,6 +256,38 @@ class HarnessController(QObject):
 
     def can_redo(self) -> bool:
         return self.undo_stack.canRedo()
+
+    # ---- Dijkstra routing helpers ----
+
+    def _compute_route_or_direct_edge(self, from_id: str, to_id: str):
+        """Returns (route_edge_ids, new_edge_or_None). If Dijkstra finds an
+        existing path, new_edge is None. If the nodes are disconnected, a
+        fresh direct Edge is constructed (but not yet added to the model —
+        the caller pushes it through AddEdgeCommand so it's undoable)."""
+        route = find_route(self.harness, from_id, to_id)
+        if route is not None:
+            return route, None
+        edge = self._make_direct_edge(from_id, to_id)
+        return [edge.edge_id], edge
+
+    def _make_direct_edge(self, from_id: str, to_id: str) -> Edge:
+        edge_id = self._generate_edge_id()
+        length = estimate_direct_length(self.harness, from_id, to_id)
+        return Edge(
+            edge_id=edge_id,
+            start_node_id=from_id,
+            end_node_id=to_id,
+            length_mm=length,
+            max_diameter_mm=0.0,
+            bend_radius_mm=0.0,
+            metadata={"auto_generated": True, "direct": True},
+        )
+
+    def _generate_edge_id(self) -> str:
+        n = 1
+        while f"SEG_AUTO_{n}" in self.harness.edges:
+            n += 1
+        return f"SEG_AUTO_{n}"
 
     # ---- command application: the ONLY place that mutates the model ----
 
@@ -238,6 +320,16 @@ class HarnessController(QObject):
         self.view.highlighted_wire_ids.discard(wire_id)
         self.view._apply_highlights()
         self.wireListChanged.emit()
+
+    def _apply_add_edge(self, edge: Edge) -> None:
+        self.harness.add_edge(edge)  # validates node references
+        self.view.add_edge_item(edge)
+        self.edgeListChanged.emit()
+
+    def _apply_remove_edge(self, edge_id: str) -> None:
+        self.view.remove_edge_item(edge_id)
+        del self.harness.edges[edge_id]
+        self.edgeListChanged.emit()
 
     def _get_entity(self, entity_kind: str, entity_id: str):
         table = {

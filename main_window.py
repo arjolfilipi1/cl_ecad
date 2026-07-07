@@ -46,6 +46,10 @@ class MainWindow(QMainWindow):
         self.side_panel = QTabWidget(self)
         self.wires_tab = WiresTab(self.controller, self.view, self)
         self.side_panel.addTab(self.wires_tab, "Wires")
+        # Add the Edges tab
+        from wires_panel import EdgesTab
+        self.edges_tab = EdgesTab(self.controller, self.view, self)
+        self.side_panel.addTab(self.edges_tab, "Edges")
 
         splitter = QSplitter(Qt.Horizontal, self)
         splitter.addWidget(self.side_panel)
