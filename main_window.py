@@ -13,7 +13,7 @@ This is the file to run:
 """
 
 from __future__ import annotations
-
+import traceback
 import sys
 from typing import Optional
 
@@ -133,6 +133,7 @@ class MainWindow(QMainWindow):
         try:
             self.view.load_json(path)
         except Exception as exc:
+            traceback.print_exc()
             QMessageBox.critical(self, "Load failed", f"Could not load '{path}':\n{exc}")
             return
         h = self.view.harness

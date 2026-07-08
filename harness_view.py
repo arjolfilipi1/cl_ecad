@@ -11,25 +11,45 @@ only knows how to load/hold/save a Harness and draw it.
 Scope for this stage:
 - Load a Harness from JSON and render it; save it back to JSON.
 - Nodes: circle (connector) / hexagon (splice) / diamond (inline joint).
-- Edges: lines between their start/end node positions.
-- Nodes can now be dragged (ItemIsMovable is on), snapped to a 10-unit
-  grid while dragging. Still NO add/delete UI.
+- Edges: lines between their start/end node positions, each with a length
+  label at its midpoint.
+- Nodes can be dragged (ItemIsMovable is on), snapped to a 10-unit grid
+  while dragging. Still NO add/delete UI for nodes.
+- Single-constraint length lock: if an Edge has length_locked=True and the
+  node being dragged has exactly one such locked edge attached, dragging
+  that node keeps it at a fixed distance from the *other* end of that
+  edge — it's constrained to a circle, not a fixed point, so any angle is
+  still allowed (a distance constraint, not a rigid rod). This overrides
+  the grid snap for that drag. Two or more locked edges on the same node
+  is a multi-constraint solve we don't attempt yet — falls back to
+  ordinary free movement in that case.
+- Every edge shows a length label (its stored length_mm). The label turns
+  red whenever the stored length doesn't match the actual on-screen
+  distance between its endpoints, for any reason — a locked edge that
+  somehow drifted, an unlocked edge whose nodes were moved without
+  updating length_mm, etc. This is a passive visual flag, not an
+  enforced constraint (unless length_locked is also set).
 
 Architecture:
 - NodeGraphicsItem / EdgeGraphicsItem are QGraphicsObject subclasses (see
   harness_controller.py for how their signals get intercepted).
-- NodeGraphicsItem snaps its own position to a 10-unit grid via
-  itemChange(ItemPositionChange) — this runs on every intermediate step
-  of a drag, not just the end, so the item visually snaps as you drag it.
+- NodeGraphicsItem.itemChange(ItemPositionChange) is where both the grid
+  snap AND the length-lock circle projection happen — but only during an
+  actual interactive drag (tracked via self._press_pos being non-None).
+  Programmatic moves (undo/redo, controller-driven changes) pass through
+  untouched, so exact constrained positions survive undo/redo without
+  being re-snapped to the grid.
 - NodeGraphicsItem emits moveFinished(node_id, old_pos, new_pos) only
   once, when the drag ends (mouseReleaseEvent) — this is the point the
   controller turns into a single undo command, instead of one command
-  per intermediate mouse-move step.
+  per intermediate mouse-move step. Whatever position itemChange settled
+  on (grid-snapped or length-constrained) is simply reported as-is; the
+  controller doesn't need to know which case applied.
 - EdgeGraphicsItem holds references to its two NodeGraphicsItem endpoints
-  and recomputes its line whenever either one moves (via a direct call
-  from NodeGraphicsItem.itemChange, not a signal — this is a purely
-  visual sync, not a model change, so it doesn't go through the
-  controller).
+  and recomputes its line (and length label) whenever either one moves
+  (via a direct call from NodeGraphicsItem.itemChange, not a signal —
+  this is a purely visual sync, not a model change, so it doesn't go
+  through the controller).
 
 Layout:
 - If a Node has an explicit `position` (x, y[, z]) it is used as-is.
@@ -74,6 +94,10 @@ NODE_PEN = QPen(QColor("#222222"), 1.5)
 
 EDGE_PEN = QPen(QColor("#555555"), 2)
 LABEL_COLOR = QColor("#222222")
+
+LENGTH_LABEL_TOLERANCE_MM = 0.5   # how far off length_mm can be from the drawn distance before it's flagged
+LENGTH_LABEL_COLOR_OK = QColor("#444444")
+LENGTH_LABEL_COLOR_BAD = QColor("#DC2626")  # red
 
 
 def _regular_polygon(radius: float, sides: int, rotation_deg: float = -90) -> QPolygonF:
@@ -165,11 +189,45 @@ class NodeGraphicsItem(QGraphicsObject):
         else:
             painter.drawEllipse(QPointF(0, 0), self.radius, self.radius)
 
+    def _locked_edge_item(self) -> Optional["EdgeGraphicsItem"]:
+        """Return this node's one length_locked edge, if exactly one is
+        attached. Two or more locked edges on the same node is a
+        multi-constraint solve we don't attempt yet (see module docstring
+        note) — in that case we fall back to ordinary free/grid-snapped
+        movement, same as having none at all."""
+        locked = [e for e in self.edges if e.edge.length_locked]
+        return locked[0] if len(locked) == 1 else None
+
     def itemChange(self, change, value):
-        if change == QGraphicsItem.ItemPositionChange:
-            # value is the proposed new position — snap it to the grid.
-            # This runs on every intermediate step of a drag, so the item
-            # visibly snaps as it moves, not just when released.
+        if change == QGraphicsItem.ItemPositionChange and self._press_pos is not None:
+            # Only intercept the proposed position during an actual
+            # interactive drag (self._press_pos is set for the whole
+            # duration of a drag, see mousePressEvent/_finish_drag).
+            # Programmatic moves (undo/redo, controller-driven changes)
+            # fall through untouched below.
+            locked_edge_item = self._locked_edge_item()
+            if locked_edge_item is not None:
+                anchor_item = (locked_edge_item.end_item if locked_edge_item.start_item is self
+                               else locked_edge_item.start_item)
+                anchor_pos = anchor_item.pos()
+                dx = value.x() - anchor_pos.x()
+                dy = value.y() - anchor_pos.y()
+                dist = math.hypot(dx, dy)
+                if dist < 1e-6:
+                    # Dragged exactly onto the anchor — direction is
+                    # undefined; hold the previous position instead of
+                    # dividing by zero.
+                    return QPointF(self.pos())
+                length_mm = locked_edge_item.edge.length_mm
+                scale = length_mm / dist
+                # Project the proposed point onto the circle of radius
+                # length_mm around the anchor — this is a distance
+                # constraint, not a rigid rod, so any angle is allowed.
+                # Deliberately NOT grid-snapped: satisfying an exact
+                # length takes priority over the 10-unit grid.
+                return QPointF(anchor_pos.x() + dx * scale, anchor_pos.y() + dy * scale)
+
+            # No active single-edge length constraint — ordinary grid snap.
             return QPointF(_snap(value.x()), _snap(value.y()))
 
         if change == QGraphicsItem.ItemPositionHasChanged:
@@ -214,10 +272,85 @@ class NodeGraphicsItem(QGraphicsObject):
 # EdgeGraphicsItem — physical bundle segment between two nodes
 # --------------------------------------------------------------------------
 
-class EdgeGraphicsItem(QGraphicsItem):
+ARROW_SIZE = 7             # px, half-height of the fix-length arrow triangles
+ARROW_GAP = 4              # px gap between the label's edge and each arrow
+LABEL_OFFSET = 12          # px the label sits above the line (perpendicular offset)
+
+
+class EdgeLengthLabel(QGraphicsTextItem):
+    """The length text on an edge. Selectable on its own (independent of
+    the edge line itself) — selecting it is what reveals the two
+    fix-length arrows, per spec ("when selecting the length label")."""
+
+    def __init__(self, edge_item: "EdgeGraphicsItem"):
+        super().__init__(edge_item)
+        self.edge_item = edge_item
+        self.setFlag(QGraphicsItem.ItemIsSelectable, True)
+
+    def itemChange(self, change, value):
+        if change == QGraphicsItem.ItemSelectedHasChanged:
+            self.edge_item.set_arrows_visible(bool(value))
+        return super().itemChange(change, value)
+
+
+class LengthFixArrowItem(QGraphicsItem):
+    """One of the two small triangles flanking a selected length label.
+    Clicking it asks the controller to rigid-translate that side of the
+    network so this edge's drawn length matches its stored length_mm
+    exactly. `side` is "start" or "end" (matching Edge.start_node_id /
+    Edge.end_node_id) — NOT tied to screen-space left/right, since an
+    edge can be at any angle; the arrow's own rotation is what makes it
+    point the right way visually."""
+
+    def __init__(self, edge_item: "EdgeGraphicsItem", side: str):
+        super().__init__(edge_item)
+        self.edge_item = edge_item
+        self.side = side
+        self.setToolTip(f"Fix length by moving the {side} side")
+        self.setVisible(False)
+        self.setAcceptedMouseButtons(Qt.LeftButton)
+
+        # A small triangle pointing along local +x; the item's own
+        # rotation (set in EdgeGraphicsItem._update_length_label) points
+        # it toward the correct node.
+        self._triangle = QPolygonF([
+            QPointF(-ARROW_SIZE, -ARROW_SIZE),
+            QPointF(ARROW_SIZE, 0),
+            QPointF(-ARROW_SIZE, ARROW_SIZE),
+        ])
+
+    def boundingRect(self) -> QRectF:
+        return QRectF(-ARROW_SIZE - 1, -ARROW_SIZE - 1, 2 * ARROW_SIZE + 2, 2 * ARROW_SIZE + 2)
+
+    def shape(self) -> QPainterPath:
+        path = QPainterPath()
+        path.addPolygon(self._triangle)
+        path.closeSubpath()
+        return path
+
+    def paint(self, painter, option: QStyleOptionGraphicsItem, widget: Optional[QWidget] = None) -> None:
+        painter.setBrush(QBrush(QColor("#2563EB")))  # blue
+        painter.setPen(QPen(QColor("#1E3A8A"), 1))
+        painter.drawPolygon(self._triangle)
+
+    def mousePressEvent(self, event) -> None:
+        event.accept()  # don't let this fall through to a rubber-band select
+
+    def mouseReleaseEvent(self, event) -> None:
+        event.accept()
+        if self.contains(event.pos()):
+            self.edge_item.fixLengthRequested.emit(self.edge_item.edge.edge_id, self.side)
+
+
+class EdgeGraphicsItem(QGraphicsObject):
     """A single Edge, drawn as a line between two NodeGraphicsItem endpoints.
     Tracks the endpoint items (not static coordinates) so it can redraw
     itself whenever either node moves."""
+
+    # Emitted when a fix-length arrow is clicked: (edge_id, side), where
+    # side is "start" or "end" — the side of the network that should be
+    # rigid-translated to make this edge's length correct.
+    fixLengthRequested = pyqtSignal(str, str)
 
     def __init__(self, edge: Edge, start_item: NodeGraphicsItem, end_item: NodeGraphicsItem,
                  parent: Optional[QGraphicsItem] = None):
@@ -236,16 +369,30 @@ class EdgeGraphicsItem(QGraphicsItem):
         start_item.register_edge(self)
         end_item.register_edge(self)
 
+        # This item is never repositioned via setPos() (it stays at local
+        # origin (0,0) forever), so children placed with setPos(x, y) sit
+        # at that exact scene coordinate — no extra transform math needed
+        # for THIS item, though the label/arrows do their own rotation.
+        self.length_label = EdgeLengthLabel(self)
+        self.start_arrow = LengthFixArrowItem(self, side="start")
+        self.end_arrow = LengthFixArrowItem(self, side="end")
+        self._update_length_label()
+
     def set_highlighted(self, on: bool) -> None:
         if on != self._highlighted:
             self._highlighted = on
             self.update()
+
+    def set_arrows_visible(self, visible: bool) -> None:
+        self.start_arrow.setVisible(visible)
+        self.end_arrow.setVisible(visible)
 
     def update_line(self) -> None:
         """Recompute the line from the live positions of the endpoint nodes."""
         self.prepareGeometryChange()
         self._line_start = QPointF(self.start_item.pos())
         self._line_end = QPointF(self.end_item.pos())
+        self._update_length_label()
         self.update()
 
     def boundingRect(self) -> QRectF:
@@ -280,16 +427,77 @@ class EdgeGraphicsItem(QGraphicsItem):
         painter.drawLine(self._line_start, self._line_end)
 
     def refresh_from_model(self) -> None:
-        """Re-sync this item's visuals (tooltip, etc.) after the controller
-        has changed a field on self.edge. Line geometry itself is driven
-        by the endpoint nodes' positions via update_line(), not this."""
+        """Re-sync this item's visuals (tooltip, length label, etc.) after
+        the controller has changed a field on self.edge (length_mm,
+        length_locked, ...). Line geometry itself is driven by the
+        endpoint nodes' positions via update_line(), not this."""
         self.setToolTip(self._tooltip())
+        self._update_length_label()
         self.update()
+
+    def _update_length_label(self) -> None:
+        """Position the length label aligned with the edge and a little
+        above it (like a CAD dimension), flanked by the two fix-length
+        arrows. Turns red whenever the stored length doesn't match the
+        actual on-screen distance between the endpoints — regardless of
+        why: a length_locked edge that somehow drifted out of sync, an
+        ordinary unlocked edge whose nodes moved without its length_mm
+        being updated, etc. A lock icon prefix marks locked edges."""
+        dx = self._line_end.x() - self._line_start.x()
+        dy = self._line_end.y() - self._line_start.y()
+        actual_distance = math.hypot(dx, dy)
+        mismatch = abs(actual_distance - self.edge.length_mm) > LENGTH_LABEL_TOLERANCE_MM
+
+        prefix = "\U0001F512 " if self.edge.length_locked else ""  # lock icon
+        self.length_label.setPlainText(f"{prefix}{self.edge.length_mm:g} mm")
+        self.length_label.setDefaultTextColor(LENGTH_LABEL_COLOR_BAD if mismatch else LENGTH_LABEL_COLOR_OK)
+
+        if actual_distance > 1e-6:
+            ux, uy = dx / actual_distance, dy / actual_distance
+        else:
+            ux, uy = 1.0, 0.0  # degenerate (coincident nodes) — arbitrary direction
+
+        # True bearing along the edge (start -> end), used for arrow
+        # rotation. Arrows always point along the real edge, unrelated to
+        # whether the label text itself gets flipped for readability below.
+        bearing_deg = math.degrees(math.atan2(dy, dx))
+
+        # Readable label angle: same bearing, but flipped 180° whenever
+        # that would otherwise render the text upside-down.
+        label_angle_deg = bearing_deg
+        if label_angle_deg > 90 or label_angle_deg < -90:
+            label_angle_deg += 180 if label_angle_deg < 0 else -180
+
+        # Perpendicular to the edge, pick whichever of the two normals
+        # points "up" on screen (Qt's y axis increases downward, so
+        # "up" is the more-negative-y candidate).
+        nx, ny = -uy, ux
+        if ny > 0:
+            nx, ny = -nx, -ny
+
+        mid_x = (self._line_start.x() + self._line_end.x()) / 2
+        mid_y = (self._line_start.y() + self._line_end.y()) / 2
+        label_center = QPointF(mid_x + nx * LABEL_OFFSET, mid_y + ny * LABEL_OFFSET)
+
+        label_rect = self.length_label.boundingRect()
+        half_w, half_h = label_rect.width() / 2, label_rect.height() / 2
+        self.length_label.setTransformOriginPoint(half_w, half_h)
+        self.length_label.setPos(label_center.x() - half_w, label_center.y() - half_h)
+        self.length_label.setRotation(label_angle_deg)
+
+        # Arrows flank the label along the TRUE bearing (not the possibly
+        # flipped label angle), just outside its rendered width.
+        arrow_offset = half_w + ARROW_GAP
+        self.end_arrow.setPos(label_center.x() + ux * arrow_offset, label_center.y() + uy * arrow_offset)
+        self.end_arrow.setRotation(bearing_deg)
+        self.start_arrow.setPos(label_center.x() - ux * arrow_offset, label_center.y() - uy * arrow_offset)
+        self.start_arrow.setRotation(bearing_deg + 180)
 
     def _tooltip(self) -> str:
         e = self.edge
         return (f"{e.edge_id}\nlength={e.length_mm}mm  "
-                f"max_diam={e.max_diameter_mm}mm  bend_r={e.bend_radius_mm}mm")
+                f"max_diam={e.max_diameter_mm}mm  bend_r={e.bend_radius_mm}mm"
+                f"{'  [length locked]' if e.length_locked else ''}")
 
 
 # --------------------------------------------------------------------------

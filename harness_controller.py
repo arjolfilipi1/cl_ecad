@@ -31,6 +31,7 @@ Not yet implemented (comes with further CAD UI work):
 
 from __future__ import annotations
 
+import math
 from typing import Any, Optional
 
 from PyQt5.QtCore import QObject, QPointF, pyqtSignal
@@ -160,7 +161,7 @@ class HarnessController(QObject):
     # ---- wiring into the scene ----
 
     def connect_scene(self) -> None:
-        """(Re)connect to every node item currently in the view, and
+        """(Re)connect to every node/edge item currently in the view, and
         re-sync self.harness. Safe to call repeatedly — old items are gone
         after a rebuild, so there's nothing stale to disconnect. Loading a
         new file replaces view.harness with a brand new Harness instance,
@@ -170,6 +171,8 @@ class HarnessController(QObject):
         self.undo_stack.clear()  # old commands would reference a now-discarded document
         for node_item in self.view.node_items.values():
             node_item.moveFinished.connect(self._on_node_move_finished)
+        for edge_item in self.view.edge_items.values():
+            edge_item.fixLengthRequested.connect(self._on_fix_length_requested)
 
     # ---- scene -> model (change interception) ----
 
@@ -183,6 +186,76 @@ class HarnessController(QObject):
             return  # no real movement
 
         self.undo_stack.push(MoveNodeCommand(self, node_id, old_pos_tuple, new_pos_tuple))
+
+    def _on_fix_length_requested(self, edge_id: str, side: str) -> None:
+        """One of an edge's fix-length arrows was clicked. Rigid-translate
+        the network on that side so the edge's drawn length matches its
+        stored length_mm exactly, moving along the edge's current bearing
+        (an "expand/contract" correction, not a re-angle).
+
+        If the edge is a bridge (removing it disconnects the graph), the
+        WHOLE side moves together, preserving its internal shape exactly
+        ("transposed with no change"). If it isn't a bridge (it's on a
+        cycle, so there's no well-defined "other side"), only the single
+        endpoint node on that side is moved instead."""
+        edge = self.harness.edges[edge_id]
+        moving_id = edge.start_node_id if side == "start" else edge.end_node_id
+        anchor_id = edge.end_node_id if side == "start" else edge.start_node_id
+
+        anchor_pos = self.harness.nodes[anchor_id].position
+        moving_pos = self.harness.nodes[moving_id].position
+        if anchor_pos is None or moving_pos is None:
+            return
+        ax, ay = anchor_pos[0], anchor_pos[1]
+        mx, my = moving_pos[0], moving_pos[1]
+        dist = math.hypot(mx - ax, my - ay)
+        if dist < 1e-9:
+            return  # coincident nodes — no sensible bearing to correct along
+
+        ux, uy = (mx - ax) / dist, (my - ay) / dist
+        target_x, target_y = ax + ux * edge.length_mm, ay + uy * edge.length_mm
+        delta = (target_x - mx, target_y - my)
+        if math.hypot(*delta) < 1e-6:
+            return  # already correct — nothing to do, don't push a no-op undo entry
+
+        component = self._reachable_component(moving_id, exclude_edge_id=edge_id)
+        if anchor_id in component:
+            # Not a bridge — the two sides are still connected some other
+            # way, so there's no clean "other side" to hold fixed. Fall
+            # back to moving just the one endpoint.
+            node_ids_to_move = {moving_id}
+        else:
+            node_ids_to_move = component
+
+        self.undo_stack.beginMacro(f"Fix length of {edge_id}")
+        for nid in node_ids_to_move:
+            pos = self.harness.nodes[nid].position
+            old = tuple(pos) if pos is not None else (0.0, 0.0)
+            new = (old[0] + delta[0], old[1] + delta[1])
+            self.undo_stack.push(MoveNodeCommand(self, nid, old, new))
+        self.undo_stack.endMacro()
+
+    def _reachable_component(self, start_node_id: str, exclude_edge_id: str) -> set:
+        """BFS over the harness graph, ignoring one specific edge. Used to
+        find "the rest of the network on this side" for the fix-length
+        arrows — if the excluded edge is a bridge, this returns exactly
+        the nodes on start_node_id's side of the cut."""
+        adjacency: dict[str, list[str]] = {}
+        for e in self.harness.edges.values():
+            if e.edge_id == exclude_edge_id:
+                continue
+            adjacency.setdefault(e.start_node_id, []).append(e.end_node_id)
+            adjacency.setdefault(e.end_node_id, []).append(e.start_node_id)
+
+        visited = {start_node_id}
+        stack = [start_node_id]
+        while stack:
+            current = stack.pop()
+            for neighbor in adjacency.get(current, []):
+                if neighbor not in visited:
+                    visited.add(neighbor)
+                    stack.append(neighbor)
+        return visited
 
     # ---- public API for editors not built yet (rename dialogs, property panels) ----
 
@@ -324,6 +397,10 @@ class HarnessController(QObject):
     def _apply_add_edge(self, edge: Edge) -> None:
         self.harness.add_edge(edge)  # validates node references
         self.view.add_edge_item(edge)
+        # connect_scene() only re-wires signals on a full rebuild; an edge
+        # added incrementally (e.g. the auto-route direct-edge fallback)
+        # needs its own signal connected here.
+        self.view.edge_items[edge.edge_id].fixLengthRequested.connect(self._on_fix_length_requested)
         self.edgeListChanged.emit()
 
     def _apply_remove_edge(self, edge_id: str) -> None:

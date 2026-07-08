@@ -76,6 +76,7 @@ class Edge:
     length_mm: float
     max_diameter_mm: float
     bend_radius_mm: float
+    length_locked: bool = False  # if True, dragging an endpoint preserves this length (see harness_view.py)
     metadata: dict = field(default_factory=dict)
 
     def to_dict(self) -> dict:
@@ -90,6 +91,7 @@ class Edge:
             length_mm=d["length_mm"],
             max_diameter_mm=d["max_diameter_mm"],
             bend_radius_mm=d["bend_radius_mm"],
+            length_locked=d.get("length_locked", False),
             metadata=d.get("metadata", {}) or {},
         )
 
@@ -225,6 +227,7 @@ class Harness:
         length_mm REAL,
         max_diameter_mm REAL,
         bend_radius_mm REAL,
+        length_locked INTEGER,
         metadata TEXT
     );
 
@@ -272,6 +275,8 @@ class Harness:
 
         for n in self.nodes.values():
             pos = n.position or (None, None, None)
+            if len(pos) == 2:
+                pos = (pos[0], pos[1], None)
             cur.execute(
                 """INSERT INTO node
                    (node_id, harness_id, node_type, label, pos_x, pos_y, pos_z, metadata)
@@ -284,10 +289,11 @@ class Harness:
             cur.execute(
                 """INSERT INTO edge
                    (edge_id, harness_id, start_node_id, end_node_id,
-                    length_mm, max_diameter_mm, bend_radius_mm, metadata)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                    length_mm, max_diameter_mm, bend_radius_mm, length_locked, metadata)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (e.edge_id, self.harness_id, e.start_node_id, e.end_node_id,
-                 e.length_mm, e.max_diameter_mm, e.bend_radius_mm, json.dumps(e.metadata)),
+                 e.length_mm, e.max_diameter_mm, e.bend_radius_mm,
+                 int(e.length_locked), json.dumps(e.metadata)),
             )
 
         for w in self.wires.values():
@@ -331,9 +337,9 @@ class Harness:
                 metadata=json.loads(meta) if meta else {},
             ))
 
-        for (edge_id, start_id, end_id, length_mm, max_d, bend_r, meta) in cur.execute(
+        for (edge_id, start_id, end_id, length_mm, max_d, bend_r, locked, meta) in cur.execute(
             "SELECT edge_id, start_node_id, end_node_id, length_mm, "
-            "max_diameter_mm, bend_radius_mm, metadata FROM edge WHERE harness_id = ?",
+            "max_diameter_mm, bend_radius_mm, length_locked, metadata FROM edge WHERE harness_id = ?",
             (harness_id,)
         ):
             h.add_edge(Edge(
@@ -343,6 +349,7 @@ class Harness:
                 length_mm=length_mm,
                 max_diameter_mm=max_d,
                 bend_radius_mm=bend_r,
+                length_locked=bool(locked),
                 metadata=json.loads(meta) if meta else {},
             ))
 

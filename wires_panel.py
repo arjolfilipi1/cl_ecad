@@ -26,6 +26,7 @@ from PyQt5.QtWidgets import (
     QTableWidget, QTableWidgetItem, QHeaderView, QAbstractItemView,
     QCheckBox, QPushButton, QLabel, QLineEdit, QComboBox, QDoubleSpinBox,
     QListWidget, QListWidgetItem, QDialog, QDialogButtonBox, QColorDialog, QMessageBox,
+    QSpinBox,
 )
 from PyQt5.QtGui import QColor
 from PyQt5.QtCore import Qt
@@ -493,6 +494,12 @@ class EditEdgeDialog(QDialog):
         self.length_spin.setValue(edge.length_mm)
         form.addRow("Length (mm):", self.length_spin)
         
+        # Length (editable)
+        self.locked_spin = QSpinBox(self)
+        self.locked_spin.setRange(0, 1)
+        self.locked_spin.setValue(edge.length_locked)
+        form.addRow("Is length locked:", self.locked_spin)
+        
         # Max Diameter (editable)
         self.diameter_spin = QDoubleSpinBox(self)
         self.diameter_spin.setRange(0.0, 1000.0)
@@ -536,4 +543,5 @@ class EditEdgeDialog(QDialog):
             "length_mm": self.length_spin.value(),
             "max_diameter_mm": self.diameter_spin.value(),
             "bend_radius_mm": self.bend_spin.value(),
+            "length_locked": self.locked_spin.value(),
         }
