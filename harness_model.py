@@ -33,6 +33,10 @@ class NodeType(str, Enum):
     CONNECTOR = "connector"
     SPLICE = "splice"
     INLINE_JOINT = "inline_joint"
+    
+class PointType(str, Enum):
+    BRANCH = "branch"          # Can have connections/fasteners
+    LAYOUT = "layout"          # Routing/visual aid only
 
 
 # --------------------------------------------------------------------------
@@ -63,6 +67,33 @@ class Node:
             metadata=d.get("metadata", {}) or {},
         )
 
+@dataclass
+class RoutePoint:
+    """A point along an edge that can be a branch point (can have wires
+    connected/fasteners attached) or a layout point (visual/routing aid)."""
+    point_id: str
+    point_type: PointType
+    edge_id: str               # The edge this point lies on
+    position: tuple            # (x, y, z) in mm
+    label: str = ""
+    metadata: dict = field(default_factory=dict)
+    
+    def to_dict(self) -> dict:
+        d = asdict(self)
+        d["point_type"] = self.point_type.value
+        d["position"] = list(self.position) if self.position else None
+        return d
+    
+    @classmethod
+    def from_dict(cls, d: dict) -> "RoutePoint":
+        return cls(
+            point_id=d["point_id"],
+            point_type=PointType(d["point_type"]),
+            edge_id=d["edge_id"],
+            position=tuple(d["position"]) if d.get("position") else None,
+            label=d.get("label", ""),
+            metadata=d.get("metadata", {}) or {},
+        )
 
 # --------------------------------------------------------------------------
 # Edge (Segments / Branches) — physical bundle casing between two nodes
@@ -76,7 +107,7 @@ class Edge:
     length_mm: float
     max_diameter_mm: float
     bend_radius_mm: float
-    length_locked: bool = False  # if True, dragging an endpoint preserves this length (see harness_view.py)
+    length_locked: bool = False  
     metadata: dict = field(default_factory=dict)
 
     def to_dict(self) -> dict:
@@ -141,8 +172,123 @@ class Harness:
         self.nodes: dict[str, Node] = {}
         self.edges: dict[str, Edge] = {}
         self.wires: dict[str, Wire] = {}
-
+        self.route_points: dict[str, RoutePoint] = {}
     # ---- mutators ----
+    def add_route_point(self, point: RoutePoint) -> None:
+        if point.edge_id not in self.edges:
+            raise ValueError(f"Route point '{point.point_id}' references unknown edge '{point.edge_id}'")
+        self.route_points[point.point_id] = point
+    
+    def split_edge_at_branch_point(self, edge_id: str, point_id: str, 
+                                   point_pos: tuple) -> tuple[Edge, Edge]:
+        """Split an edge at a branch point, creating two new edges.
+        Returns (edge_a, edge_b) where edge_a goes from start->point and
+        edge_b goes from point->end."""
+        old_edge = self.edges[edge_id]
+        
+        # Calculate lengths based on positions
+        start_pos = self.nodes[old_edge.start_node_id].position
+        end_pos = self.nodes[old_edge.end_node_id].position
+        if start_pos is None or end_pos is None:
+            raise ValueError(f"Node positions missing for edge {edge_id}")
+        
+        # Calculate distances
+        dist_start_to_point = math.hypot(
+            point_pos[0] - start_pos[0],
+            point_pos[1] - start_pos[1]
+        )
+        dist_point_to_end = math.hypot(
+            end_pos[0] - point_pos[0],
+            end_pos[1] - point_pos[1]
+        )
+        
+        # Create two new edges
+        edge_a = Edge(
+            edge_id=f"{old_edge.edge_id}_A",
+            start_node_id=old_edge.start_node_id,
+            end_node_id=point_id,
+            length_mm=dist_start_to_point,
+            max_diameter_mm=old_edge.max_diameter_mm,
+            bend_radius_mm=old_edge.bend_radius_mm,
+            length_locked=old_edge.length_locked,
+            metadata=old_edge.metadata.copy(),
+        )
+        
+        edge_b = Edge(
+            edge_id=f"{old_edge.edge_id}_B",
+            start_node_id=point_id,
+            end_node_id=old_edge.end_node_id,
+            length_mm=dist_point_to_end,
+            max_diameter_mm=old_edge.max_diameter_mm,
+            bend_radius_mm=old_edge.bend_radius_mm,
+            length_locked=old_edge.length_locked,
+            metadata=old_edge.metadata.copy(),
+        )
+        
+        # Remove old edge, add new ones
+        del self.edges[edge_id]
+        self.edges[edge_a.edge_id] = edge_a
+        self.edges[edge_b.edge_id] = edge_b
+        
+        # Update any wires that used this edge
+        for wire in self.wires.values():
+            if edge_id in wire.route_edge_ids:
+                idx = wire.route_edge_ids.index(edge_id)
+                wire.route_edge_ids[idx:idx+1] = [edge_a.edge_id, edge_b.edge_id]
+        
+        return edge_a, edge_b
+    
+    def merge_branch_point(self, point_id: str) -> None:
+        """Merge a branch point back into its parent edge, like in RapidHarness."""
+        point = self.route_points[point_id]
+        if point.point_type != PointType.BRANCH:
+            return  # Only merge branch points
+        
+        # Find the two edges that connect to this point
+        connected_edges = [
+            e for e in self.edges.values()
+            if e.start_node_id == point_id or e.end_node_id == point_id
+        ]
+        
+        if len(connected_edges) != 2:
+            return  # Can't merge if not exactly 2 edges
+        
+        # Determine which edge is the "main" one and which is the branch
+        # For simplicity, merge them back into one edge
+        edge_a, edge_b = connected_edges[0], connected_edges[1]
+        
+        # Determine start and end nodes
+        start_id = edge_a.start_node_id if edge_a.start_node_id != point_id else edge_a.end_node_id
+        end_id = edge_b.end_node_id if edge_b.start_node_id == point_id else edge_b.start_node_id
+        
+        # Create merged edge
+        merged_edge = Edge(
+            edge_id=point_id,  # Reuse the point ID as the edge ID
+            start_node_id=start_id,
+            end_node_id=end_id,
+            length_mm=edge_a.length_mm + edge_b.length_mm,
+            max_diameter_mm=max(edge_a.max_diameter_mm, edge_b.max_diameter_mm),
+            bend_radius_mm=min(edge_a.bend_radius_mm, edge_b.bend_radius_mm),
+            length_locked=edge_a.length_locked or edge_b.length_locked,
+            metadata=edge_a.metadata.copy(),
+        )
+        
+        # Remove old edges and point
+        del self.edges[edge_a.edge_id]
+        del self.edges[edge_b.edge_id]
+        del self.route_points[point_id]
+        self.edges[merged_edge.edge_id] = merged_edge
+        
+        # Update wires
+        for wire in self.wires.values():
+            route = wire.route_edge_ids
+            if edge_a.edge_id in route and edge_b.edge_id in route:
+                idx_a = route.index(edge_a.edge_id)
+                idx_b = route.index(edge_b.edge_id)
+                if idx_a < idx_b:
+                    route[idx_a:idx_b+1] = [merged_edge.edge_id]
+                else:
+                    route[idx_b:idx_a+1] = [merged_edge.edge_id]
 
     def add_node(self, node: Node) -> None:
         self.nodes[node.node_id] = node
@@ -171,7 +317,9 @@ class Harness:
             "nodes": [n.to_dict() for n in self.nodes.values()],
             "edges": [e.to_dict() for e in self.edges.values()],
             "wires": [w.to_dict() for w in self.wires.values()],
+            "route_points": [p.to_dict() for p in self.route_points.values()],
         }
+
 
     def to_json(self, indent: int = 2) -> str:
         return json.dumps(self.to_dict(), indent=indent)
@@ -185,7 +333,10 @@ class Harness:
             h.add_edge(Edge.from_dict(ed))
         for wd in d.get("wires", []):
             h.add_wire(Wire.from_dict(wd))
+        for pd in d.get("route_points", []):
+            h.add_route_point(RoutePoint.from_dict(pd))
         return h
+
 
     @classmethod
     def from_json(cls, s: str) -> "Harness":

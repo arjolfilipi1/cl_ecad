@@ -7,8 +7,8 @@
       "node_type": "connector",
       "label": "STVB 01",
       "position": [
-        -30.0,
-        -150.0
+        -9.654575824487964,
+        -148.304547985374
       ],
       "metadata": {}
     },
@@ -17,8 +17,8 @@
       "node_type": "connector",
       "label": "STVB 02",
       "position": [
-        -50.0,
-        -100.0
+        -19.630597574437687,
+        -108.67697212158924
       ],
       "metadata": {}
     },
@@ -27,8 +27,8 @@
       "node_type": "connector",
       "label": "STVB 03",
       "position": [
-        -30.0,
-        -60.0
+        13.418201557776456,
+        -8.47834940294186
       ],
       "metadata": {}
     },
@@ -37,8 +37,8 @@
       "node_type": "connector",
       "label": "STVB 04",
       "position": [
-        270.0,
-        -110.0
+        268.51084182776924,
+        -146.4194414679392
       ],
       "metadata": {}
     },
@@ -47,8 +47,8 @@
       "node_type": "connector",
       "label": "STVB 05",
       "position": [
-        260.0,
-        -70.0
+        358.1566485576676,
+        -29.58255647625451
       ],
       "metadata": {}
     },
@@ -57,8 +57,8 @@
       "node_type": "inline_joint",
       "label": "STVBF 01",
       "position": [
-        180.0,
-        30.0
+        192.9352984921872,
+        54.433341596353586
       ],
       "metadata": {}
     },
@@ -81,6 +81,7 @@
       "length_mm": 100.0,
       "max_diameter_mm": 8.5,
       "bend_radius_mm": 25.0,
+      "length_locked": false,
       "metadata": {}
     },
     {
@@ -90,6 +91,7 @@
       "length_mm": 220.0,
       "max_diameter_mm": 6.0,
       "bend_radius_mm": 18.0,
+      "length_locked": false,
       "metadata": {}
     },
     {
@@ -99,6 +101,7 @@
       "length_mm": 114.0175425099138,
       "max_diameter_mm": 0.0,
       "bend_radius_mm": 0.0,
+      "length_locked": false,
       "metadata": {
         "auto_generated": true,
         "direct": true
@@ -108,9 +111,10 @@
       "edge_id": "SEG_AUTO_2",
       "start_node_id": "STVB 03",
       "end_node_id": "STVB 04",
-      "length_mm": 290.68883707497264,
+      "length_mm": 290.0,
       "max_diameter_mm": 0.0,
       "bend_radius_mm": 0.0,
+      "length_locked": false,
       "metadata": {
         "auto_generated": true,
         "direct": true
@@ -120,9 +124,10 @@
       "edge_id": "SEG_AUTO_3",
       "start_node_id": "STVB 05",
       "end_node_id": "SPLICE_1",
-      "length_mm": 268.70057685088807,
+      "length_mm": 290.0,
       "max_diameter_mm": 0.0,
       "bend_radius_mm": 0.0,
+      "length_locked": false,
       "metadata": {
         "auto_generated": true,
         "direct": true
@@ -249,6 +254,19 @@
       "route_edge_ids": [
         "SEG_AUTO_3"
       ],
+      "metadata": {}
+    }
+  ],
+  "route_points": [
+    {
+      "point_id": "SEG_AUTO_2_point_1",
+      "point_type": "branch",
+      "edge_id": "SEG_AUTO_2",
+      "position": [
+        170.0,
+        -205.0
+      ],
+      "label": "Point 1",
       "metadata": {}
     }
   ]

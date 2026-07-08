@@ -78,6 +78,46 @@ class AddEdgeCommand(QUndoCommand):
     def undo(self) -> None:
         self.controller._apply_remove_edge(self.edge.edge_id)
 
+class AddRoutePointCommand(QUndoCommand):
+    def __init__(self, controller: "HarnessController", point: RoutePoint):
+        super().__init__(f"Add {point.point_type.value} point {point.point_id}")
+        self.controller = controller
+        self.point = point
+    
+    def redo(self) -> None:
+        self.controller._apply_add_route_point(self.point)
+    
+    def undo(self) -> None:
+        self.controller._apply_delete_route_point(self.point.point_id)
+
+class MergeBranchPointCommand(QUndoCommand):
+    def __init__(self, controller: "HarnessController", point_id: str):
+        super().__init__(f"Merge branch point {point_id}")
+        self.controller = controller
+        self.point_id = point_id
+    
+    def redo(self) -> None:
+        self.controller._apply_merge_branch_point(self.point_id)
+    
+    def undo(self) -> None:
+        # Undo merge by re-splitting the edge
+        # This is complex - store the split state
+        pass
+
+class DeleteRoutePointCommand(QUndoCommand):
+    def __init__(self, controller: "HarnessController", point_id: str):
+        super().__init__(f"Delete layout point {point_id}")
+        self.controller = controller
+        self.point_id = point_id
+    
+    def redo(self) -> None:
+        self.controller._apply_delete_route_point(self.point_id)
+    
+    def undo(self) -> None:
+        # Re-add the point
+        pass
+
+
 
 class AddWireCommand(QUndoCommand):
     """Undoable creation of a new Wire."""
@@ -138,7 +178,7 @@ class HarnessController(QObject):
     # Same idea, for edges — fires when Dijkstra routing has to fall back
     # to creating a brand new direct edge.
     edgeListChanged = pyqtSignal()
-
+    pointListChanged = pyqtSignal()  # New signal for points list changes
     def __init__(self, view, parent: Optional[QObject] = None):
         super().__init__(parent)
         self.view = view
@@ -173,6 +213,8 @@ class HarnessController(QObject):
             node_item.moveFinished.connect(self._on_node_move_finished)
         for edge_item in self.view.edge_items.values():
             edge_item.fixLengthRequested.connect(self._on_fix_length_requested)
+        for point_item in self.view.route_point_items.values():
+            point_item.moveFinished.connect(self._on_point_move_finished)
 
     # ---- scene -> model (change interception) ----
 
@@ -186,6 +228,35 @@ class HarnessController(QObject):
             return  # no real movement
 
         self.undo_stack.push(MoveNodeCommand(self, node_id, old_pos_tuple, new_pos_tuple))
+    def _on_point_move_finished(self, point_id: str, old_pos: QPointF, new_pos: QPointF) -> None:
+        """Handle a route point being moved."""
+        if self._applying:
+            return
+        
+        old_tuple = (old_pos.x(), old_pos.y())
+        new_tuple = (new_pos.x(), new_pos.y())
+        if old_tuple == new_tuple:
+            return
+        
+        # Update the model
+        point = self.harness.route_points[point_id]
+        point.position = new_tuple
+        self.modelChanged.emit("point", point_id)
+    
+    def add_route_point(self, point: RoutePoint) -> None:
+        """Add a route point (branch or layout)."""
+        self.undo_stack.push(AddRoutePointCommand(self, point))
+    
+    def merge_branch_point(self, point_id: str) -> None:
+        """Merge a branch point back into its edge."""
+        self.undo_stack.push(MergeBranchPointCommand(self, point_id))
+    
+    def delete_route_point(self, point_id: str) -> None:
+        """Delete a layout point (branch points must be merged first)."""
+        point = self.harness.route_points[point_id]
+        if point.point_type == PointType.BRANCH:
+            raise ValueError("Branch points must be merged before deletion")
+        self.undo_stack.push(DeleteRoutePointCommand(self, point_id))
 
     def _on_fix_length_requested(self, edge_id: str, side: str) -> None:
         """One of an edge's fix-length arrows was clicked. Rigid-translate
@@ -420,3 +491,19 @@ class HarnessController(QObject):
 
     def _on_model_changed(self, entity_kind: str, entity_id: str) -> None:
         self.view.refresh_entity(entity_kind, entity_id)
+    def _apply_add_route_point(self, point: RoutePoint) -> None:
+        self.harness.add_route_point(point)
+        self.view.add_route_point_item(point)
+        self.pointListChanged.emit()
+
+    def _apply_delete_route_point(self, point_id: str) -> None:
+        del self.harness.route_points[point_id]
+        self.view.remove_route_point_item(point_id)
+        self.pointListChanged.emit()
+
+    def _apply_merge_branch_point(self, point_id: str) -> None:
+        self.harness.merge_branch_point(point_id)
+        self.view.remove_route_point_item(point_id)
+        # Rebuild affected edges
+        self.view.render()  # Full rebuild for simplicity
+        self.pointListChanged.emit()
