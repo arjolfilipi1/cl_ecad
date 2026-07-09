@@ -65,32 +65,44 @@ from typing import Optional
 
 from PyQt5.QtWidgets import (
     QGraphicsView, QGraphicsScene,
-    QGraphicsItem, QGraphicsObject, QGraphicsTextItem, QWidget, QStyleOptionGraphicsItem,QMenu
+    QGraphicsItem, QGraphicsObject, QGraphicsTextItem, QWidget, QStyleOptionGraphicsItem,
+    QMenu,QLabel
 )
 from PyQt5.QtGui import QBrush, QPen, QColor, QPolygonF, QPainter, QPainterPath
-from PyQt5.QtCore import Qt, QPointF, QRectF, pyqtSignal
+from PyQt5.QtCore import Qt, QPointF, QRectF,QSettings, pyqtSignal
 
-from harness_model import Harness, Node, Edge, NodeType,PointType,RoutePoint
+from harness_model import Harness, Node, Edge, NodeType, BRANCH_MERGE_DISTANCE_MM
 
 
 # --------------------------------------------------------------------------
 # Visual constants
 # --------------------------------------------------------------------------
 
-NODE_RADIUS = 18          # px, for connector circles / bounding size for polygons
+NODE_RADIUS = 18          # px, default radius for connector/splice/inline_joint
+BRANCH_POINT_RADIUS = 12  # smaller — a marker, not a full connector
+LAYOUT_POINT_RADIUS = 7   # smallest — purely a routing/visual aid, not a physical part
 GRID_SPACING_X = 140      # fallback auto-layout spacing (nodes with no saved position)
 GRID_SPACING_Y = 120
 GRID_COLUMNS = 6
 
-DRAG_SNAP = 5             # nodes snap to this grid size (scene units) while dragging
+DRAG_SNAP = 10            # nodes snap to this grid size (scene units) while dragging
+
+NODE_RADII = {
+    NodeType.BRANCH_POINT: BRANCH_POINT_RADIUS,
+    NodeType.LAYOUT_POINT: LAYOUT_POINT_RADIUS,
+}
 
 NODE_COLORS = {
-    NodeType.CONNECTOR: QColor("#3B82F6"),     # blue
-    NodeType.SPLICE: QColor("#F59E0B"),        # amber
-    NodeType.INLINE_JOINT: QColor("#10B981"),  # green
+    NodeType.CONNECTOR: QColor("#3B82F6"),      # blue
+    NodeType.SPLICE: QColor("#F59E0B"),         # amber
+    NodeType.INLINE_JOINT: QColor("#10B981"),   # green
+    NodeType.BRANCH_POINT: QColor("#8B5CF6"),   # violet — a future anchor point, not wired up yet
+    NodeType.LAYOUT_POINT: QColor("#9CA3AF"),   # neutral grey — not a physical part at all
 }
 NODE_SELECTED_COLOR = QColor("#EF4444")  # red outline when selected
 NODE_PEN = QPen(QColor("#222222"), 1.5)
+MERGE_PREVIEW_COLOR = QColor("#22C55E")      # green — shown live while dragging a branch point near another
+MERGE_PREVIEW_PEN = QPen(QColor("#16A34A"), 2.5)  # darker green outline
 
 EDGE_PEN = QPen(QColor("#555555"), 2)
 LABEL_COLOR = QColor("#222222")
@@ -98,10 +110,6 @@ LABEL_COLOR = QColor("#222222")
 LENGTH_LABEL_TOLERANCE_MM = 0.5   # how far off length_mm can be from the drawn distance before it's flagged
 LENGTH_LABEL_COLOR_OK = QColor("#444444")
 LENGTH_LABEL_COLOR_BAD = QColor("#DC2626")  # red
-BRANCH_POINT_COLOR = QColor("#8B5CF6")  # Purple
-LAYOUT_POINT_COLOR = QColor("#94A3B8")  # Gray
-BRANCH_POINT_RADIUS = 10
-LAYOUT_POINT_RADIUS = 6
 
 
 def _regular_polygon(radius: float, sides: int, rotation_deg: float = -90) -> QPolygonF:
@@ -135,18 +143,24 @@ class NodeGraphicsItem(QGraphicsObject):
     # produces exactly one undo command.
     moveFinished = pyqtSignal(str, QPointF, QPointF)
 
-    def __init__(self, node: Node, radius: float = NODE_RADIUS, parent: Optional[QGraphicsItem] = None):
+    def __init__(self, node: Node, radius: Optional[float] = None, parent: Optional[QGraphicsItem] = None):
         super().__init__(parent)
         self.node = node
-        self.radius = radius
+        self.radius = radius if radius is not None else NODE_RADII.get(node.node_type, NODE_RADIUS)
         self.edges: list["EdgeGraphicsItem"] = []  # edges attached to this node
         self._press_pos: Optional[QPointF] = None  # position at the start of the current drag
+        self._merge_preview = False  # true while dragging a BRANCH_POINT within merge range of another
 
         self._polygon: Optional[QPolygonF] = None  # None => draw as ellipse
         if node.node_type == NodeType.SPLICE:
-            self._polygon = _regular_polygon(radius, sides=6)
+            self._polygon = _regular_polygon(self.radius, sides=6)
         elif node.node_type == NodeType.INLINE_JOINT:
-            self._polygon = _regular_polygon(radius, sides=4, rotation_deg=45)
+            self._polygon = _regular_polygon(self.radius, sides=4, rotation_deg=45)
+        elif node.node_type == NodeType.BRANCH_POINT:
+            self._polygon = _regular_polygon(self.radius, sides=3)  # triangle
+        elif node.node_type == NodeType.LAYOUT_POINT:
+            r = self.radius
+            self._polygon = QPolygonF([QPointF(-r, -r), QPointF(r, -r), QPointF(r, r), QPointF(-r, r)])  # square
         # CONNECTOR stays as ellipse (self._polygon is None)
 
         self.setToolTip(self._tooltip())
@@ -157,7 +171,7 @@ class NodeGraphicsItem(QGraphicsObject):
         self.label_item = QGraphicsTextItem(node.label or node.node_id, self)
         self.label_item.setDefaultTextColor(LABEL_COLOR)
         label_rect = self.label_item.boundingRect()
-        self.label_item.setPos(-label_rect.width() / 2, radius + 2)
+        self.label_item.setPos(-label_rect.width() / 2, self.radius + 2)
 
     # ---- bookkeeping used by EdgeGraphicsItem ----
 
@@ -184,8 +198,12 @@ class NodeGraphicsItem(QGraphicsObject):
         return path
 
     def paint(self, painter, option: QStyleOptionGraphicsItem, widget: Optional[QWidget] = None) -> None:
-        color = NODE_COLORS.get(self.node.node_type, QColor("#888888"))
-        pen = QPen(NODE_SELECTED_COLOR, 2.5) if self.isSelected() else NODE_PEN
+        if self._merge_preview:
+            color = MERGE_PREVIEW_COLOR
+            pen = MERGE_PREVIEW_PEN
+        else:
+            color = NODE_COLORS.get(self.node.node_type, QColor("#888888"))
+            pen = QPen(NODE_SELECTED_COLOR, 2.5) if self.isSelected() else NODE_PEN
         painter.setBrush(QBrush(color))
         painter.setPen(pen)
         if self._polygon is not None:
@@ -201,6 +219,30 @@ class NodeGraphicsItem(QGraphicsObject):
         movement, same as having none at all."""
         locked = [e for e in self.edges if e.edge.length_locked]
         return locked[0] if len(locked) == 1 else None
+
+    def _nearby_branch_point(self) -> Optional["NodeGraphicsItem"]:
+        """If this is a BRANCH_POINT, return the closest OTHER BRANCH_POINT
+        item in the scene within BRANCH_MERGE_DISTANCE_MM, if any. Only
+        branch points participate in merging — layout points, connectors,
+        etc. never trigger or receive this."""
+        if self.node.node_type != NodeType.BRANCH_POINT or self.scene() is None:
+            return None
+        my_pos = self.pos()
+        best_item, best_dist = None, BRANCH_MERGE_DISTANCE_MM
+        for item in self.scene().items():
+            if (isinstance(item, NodeGraphicsItem) and item is not self
+                    and item.node.node_type == NodeType.BRANCH_POINT):
+                other_pos = item.pos()
+                dist = math.hypot(my_pos.x() - other_pos.x(), my_pos.y() - other_pos.y())
+                if dist <= best_dist:
+                    best_dist = dist
+                    best_item = item
+        return best_item
+
+    def _set_merge_preview(self, on: bool) -> None:
+        if on != self._merge_preview:
+            self._merge_preview = on
+            self.update()
 
     def itemChange(self, change, value):
         if change == QGraphicsItem.ItemPositionChange and self._press_pos is not None:
@@ -237,6 +279,10 @@ class NodeGraphicsItem(QGraphicsObject):
         if change == QGraphicsItem.ItemPositionHasChanged:
             for edge_item in self.edges:
                 edge_item.update_line()
+            if self._press_pos is not None:
+                # Live "would this merge on release?" preview, only during
+                # an actual interactive drag.
+                self._set_merge_preview(self._nearby_branch_point() is not None)
 
         return super().itemChange(change, value)
 
@@ -255,6 +301,7 @@ class NodeGraphicsItem(QGraphicsObject):
             return
         old_pos, new_pos = self._press_pos, QPointF(self.pos())
         self._press_pos = None
+        self._set_merge_preview(False)  # drag is over — the live preview color goes away either way
         if old_pos != new_pos:
             self.moveFinished.emit(self.node.node_id, old_pos, new_pos)
 
@@ -266,12 +313,21 @@ class NodeGraphicsItem(QGraphicsObject):
         label_rect = self.label_item.boundingRect()
         self.label_item.setPos(-label_rect.width() / 2, self.radius + 2)
         self.setToolTip(self._tooltip())
+
+        # Hide the node entirely if it has been merged into another
+        is_merged = bool(self.node.metadata.get("merged_into"))
+        self.setVisible(not is_merged)
+
         self.update()
 
     def _tooltip(self) -> str:
-        return f"{self.node.node_id} ({self.node.node_type.value})\n{self.node.label}"
+        text = f"{self.node.node_id} ({self.node.node_type.value})\n{self.node.label}"
+        merged_into = self.node.metadata.get("merged_into")
+        if merged_into:
+            text += f"\n(merged into {merged_into})"
+        return text
 
-
+    
 # --------------------------------------------------------------------------
 # EdgeGraphicsItem — physical bundle segment between two nodes
 # --------------------------------------------------------------------------
@@ -285,11 +341,15 @@ class EdgeLengthLabel(QGraphicsTextItem):
     """The length text on an edge. Selectable on its own (independent of
     the edge line itself) — selecting it is what reveals the two
     fix-length arrows, per spec ("when selecting the length label")."""
-
+    doubleClicked = pyqtSignal(str)
     def __init__(self, edge_item: "EdgeGraphicsItem"):
         super().__init__(edge_item)
         self.edge_item = edge_item
         self.setFlag(QGraphicsItem.ItemIsSelectable, True)
+    def mouseDoubleClickEvent(self, event) -> None:
+        """Emit signal when label is double-clicked."""
+        self.doubleClicked.emit(self.edge_item.edge.edge_id)
+        super().mouseDoubleClickEvent(event)
 
     def itemChange(self, change, value):
         if change == QGraphicsItem.ItemSelectedHasChanged:
@@ -356,6 +416,10 @@ class EdgeGraphicsItem(QGraphicsObject):
     # rigid-translated to make this edge's length correct.
     fixLengthRequested = pyqtSignal(str, str)
 
+    # Emitted from the right-click menu: (edge_id, scene_click_pos, node_type_value)
+    # node_type_value is a NodeType.value string ("branch_point" or "layout_point").
+    splitRequested = pyqtSignal(str, QPointF, str)
+    editRequested = pyqtSignal(str)
     def __init__(self, edge: Edge, start_item: NodeGraphicsItem, end_item: NodeGraphicsItem,
                  parent: Optional[QGraphicsItem] = None):
         super().__init__(parent)
@@ -365,13 +429,11 @@ class EdgeGraphicsItem(QGraphicsObject):
         self._line_start = QPointF(start_item.pos())
         self._line_end = QPointF(end_item.pos())
         self._highlighted = False  # true when a highlighted wire's route passes through this edge
-        self._hovered = False  # true when mouse is hovering over this edge
 
         self.setToolTip(self._tooltip())
         self.setZValue(-1)  # draw behind nodes
         self.setFlag(QGraphicsItem.ItemIsSelectable, True)
-        self.setAcceptHoverEvents(True)
-        
+
         start_item.register_edge(self)
         end_item.register_edge(self)
 
@@ -380,52 +442,22 @@ class EdgeGraphicsItem(QGraphicsObject):
         # at that exact scene coordinate — no extra transform math needed
         # for THIS item, though the label/arrows do their own rotation.
         self.length_label = EdgeLengthLabel(self)
+        self.length_label.doubleClicked.connect(self._on_label_double_clicked)
         self.start_arrow = LengthFixArrowItem(self, side="start")
         self.end_arrow = LengthFixArrowItem(self, side="end")
         self._update_length_label()
-        self.route_point_items: dict[str, RoutePointGraphicsItem] = {}
-        self._create_route_points()
-    def hoverEnterEvent(self, event) -> None:
-        """Mouse entered the edge area."""
-        self._hovered = True
-        self.update()
-        super().hoverEnterEvent(event)
-
-    def hoverLeaveEvent(self, event) -> None:
-        """Mouse left the edge area."""
-        self._hovered = False
-        self.update()
-        super().hoverLeaveEvent(event)
+    def _on_label_double_clicked(self, edge_id: str) -> None:
+        """Handle double-click on the length label - ask controller to open edit dialog."""
+        self.editRequested.emit(edge_id)
 
     def set_highlighted(self, on: bool) -> None:
         if on != self._highlighted:
             self._highlighted = on
             self.update()
-            
-    def _create_route_points(self) -> None:
-        """Create graphics items for route points on this edge."""
-        if self.edge is None:
-            return
-        harness = self.get_harness()
-        if harness is None:
-            return
-        
-        for point in harness.route_points.values():
-            if point.edge_id == self.edge.edge_id:
-                point_item = RoutePointGraphicsItem(point, self)
-                point_item.setPos(point.position[0], point.position[1])
-                self.route_point_items[point.point_id] = point_item
 
     def set_arrows_visible(self, visible: bool) -> None:
         self.start_arrow.setVisible(visible)
         self.end_arrow.setVisible(visible)
-        
-    def get_harness(self) -> Optional[Harness]:
-        """Helper to get the harness from the scene."""
-        # This is a bit of a hack - we'll store a reference
-        if hasattr(self, '_harness_ref'):
-            return self._harness_ref
-        return None
 
     def update_line(self) -> None:
         """Recompute the line from the live positions of the endpoint nodes."""
@@ -436,12 +468,12 @@ class EdgeGraphicsItem(QGraphicsObject):
         self.update()
 
     def boundingRect(self) -> QRectF:
-        pad = EDGE_PEN.widthF()*2
+        pad = EDGE_PEN.widthF()
         return QRectF(self._line_start, self._line_end).normalized().adjusted(-pad, -pad, pad, pad)
 
     def shape(self) -> QPainterPath:
         stroker_path = QPainterPath()
-        stroker_path.addPolygon(self._widen_line(width=8.0))  # easier to click than the bare line
+        stroker_path.addPolygon(self._widen_line(width=6.0))  # easier to click than the bare line
         return stroker_path
 
     def _widen_line(self, width: float) -> QPolygonF:
@@ -457,38 +489,14 @@ class EdgeGraphicsItem(QGraphicsObject):
         ])
 
     def paint(self, painter, option: QStyleOptionGraphicsItem, widget: Optional[QWidget] = None) -> None:
-        # Determine pen based on state (priority: hover > highlighted > selected > normal)
-        if self._hovered:
-            # Hover state: bright blue with glow effect
-            pen = QPen(QColor("#3B82F6"), EDGE_PEN.widthF() + 3)
-            pen.setCapStyle(Qt.RoundCap)
-            painter.setPen(pen)
-            painter.drawLine(self._line_start, self._line_end)
-            
-            # Draw a glow effect (semi-transparent wider line)
-            glow_pen = QPen(QColor("#3B82F6"), EDGE_PEN.widthF() + 8)
-            glow_pen.setCapStyle(Qt.RoundCap)
-            glow_pen.setColor(QColor(59, 130, 246, 80))  # Semi-transparent blue
-            painter.setPen(glow_pen)
-            painter.drawLine(self._line_start, self._line_end)
-        elif self._highlighted:
-            # Wire highlight: amber, thicker
-            pen = QPen(QColor("#FBBF24"), EDGE_PEN.widthF() + 2)
-            pen.setCapStyle(Qt.RoundCap)
-            painter.setPen(pen)
-            painter.drawLine(self._line_start, self._line_end)
+        if self._highlighted:
+            pen = QPen(QColor("#FBBF24"), EDGE_PEN.widthF() + 2)  # amber, thicker
         elif self.isSelected():
-            # Selected: red
             pen = QPen(QColor("#EF4444"), EDGE_PEN.widthF())
-            pen.setCapStyle(Qt.RoundCap)
-            painter.setPen(pen)
-            painter.drawLine(self._line_start, self._line_end)
         else:
-            # Normal: default gray
             pen = EDGE_PEN
-            painter.setPen(pen)
-            painter.drawLine(self._line_start, self._line_end)
-
+        painter.setPen(pen)
+        painter.drawLine(self._line_start, self._line_end)
 
     def refresh_from_model(self) -> None:
         """Re-sync this item's visuals (tooltip, length label, etc.) after
@@ -563,6 +571,17 @@ class EdgeGraphicsItem(QGraphicsObject):
                 f"max_diam={e.max_diameter_mm}mm  bend_r={e.bend_radius_mm}mm"
                 f"{'  [length locked]' if e.length_locked else ''}")
 
+    def contextMenuEvent(self, event) -> None:
+        menu = QMenu()
+        branch_action = menu.addAction("Add Branch Point Here")
+        layout_action = menu.addAction("Add Layout Point Here")
+        chosen = menu.exec_(event.screenPos())
+        if chosen is branch_action:
+            self.splitRequested.emit(self.edge.edge_id, event.scenePos(), NodeType.BRANCH_POINT.value)
+        elif chosen is layout_action:
+            self.splitRequested.emit(self.edge.edge_id, event.scenePos(), NodeType.LAYOUT_POINT.value)
+        event.accept()
+
 
 # --------------------------------------------------------------------------
 # HarnessGraphicsView — the canvas widget
@@ -580,59 +599,87 @@ class HarnessGraphicsView(QGraphicsView):
 
     def __init__(self, parent: Optional[QWidget] = None):
         super().__init__(parent)
-        self.parent = parent
+
         self.harness: Optional[Harness] = None
         self.current_path: Optional[str] = None
         self.node_items: dict[str, NodeGraphicsItem] = {}
         self.edge_items: dict[str, EdgeGraphicsItem] = {}
-        self.route_point_items: dict[str, RoutePointGraphicsItem] = {}
         self.highlighted_wire_ids: set[str] = set()  # wires currently toggled "on" in the Wires tab
 
         self.scene = QGraphicsScene(self)
         self.setScene(self.scene)
         self.setRenderHint(QPainter.Antialiasing)
         self.setDragMode(QGraphicsView.RubberBandDrag)  # click-drag on empty space = select; on a node = move it
-        
-        self.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
-        self.customContextMenuRequested.connect(self._show_context_menu)
-        self.setFocusPolicy(Qt.StrongFocus)
-    # ---- load / save (no dialogs, no message boxes — that's main_window's job) ----
-    def add_route_point_item(self, point: RoutePoint) -> None:
-        """Add a route point item to the scene."""
-        edge_item = self.edge_items.get(point.edge_id)
-        if edge_item is None:
-            raise ValueError(f"Cannot add route point '{point.point_id}': edge '{point.edge_id}' not in scene")
-        
-        point_item = RoutePointGraphicsItem(point, edge_item)
-        point_item.setPos(QPointF(point.position[0], point.position[1]))
-        self.scene.addItem(point_item)
-        self.route_point_items[point.point_id] = point_item
-        
-        # Connect signals for the controller
-        if hasattr(self, 'controller'):
-            point_item.moveFinished.connect(self.controller._on_point_move_finished)
-    
-    def remove_route_point_item(self, point_id: str) -> None:
-        """Remove a route point item from the scene."""
-        point_item = self.route_point_items.pop(point_id, None)
-        if point_item is None:
-            return
-        self.scene.removeItem(point_item)
+        self.setTransformationAnchor(QGraphicsView.NoAnchor)
+        self.setResizeAnchor(QGraphicsView.NoAnchor)
+        self._pan_start = None
 
-    def keyPressEvent(self,event):
-        if event.key() == Qt.Key_Menu:
-            self._show_context_menu_for_selected()
+        # Load initial grid state from settings
+        self.load_settings()
+
+        # Built-in Floating HUD Zoom Indicator
+        self.zoom_label = QLabel(self)
+        self.zoom_label.setStyleSheet("""
+            QLabel {
+                background-color: rgba(45, 45, 45, 180);
+                color: #FFFFFF;
+                border-radius: 4px;
+                padding: 4px 8px;
+                font-family: 'Segoe UI', sans-serif;
+                font-size: 11px;
+                font-weight: bold;
+            }
+        """)
+        self._update_zoom_indicator()
+    def load_settings(self) -> None:
+        """Reads configuration choices from the global app registry."""
+        settings = QSettings("MyCompany", "HarnessApp")
+        self.grid_enabled = settings.value("show_grid", True, type=bool)
+        self.viewport().update()  # Force background repaint
+    # ---- HUD Overlay Positioning ----
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        self._position_zoom_label()
+
+    def _position_zoom_label(self) -> None:
+        if hasattr(self, 'zoom_label'):
+            margin = 15
+            x = self.width() - self.zoom_label.width() - margin
+            y = self.height() - self.zoom_label.height() - margin
+            self.zoom_label.move(x, y)
+
+    def _update_zoom_indicator(self) -> None:
+        scale_factor = self.transform().m11()  # Extracts current scale ratio
+        self.zoom_label.setText(f"Zoom: {scale_factor * 100:.0f}%")
+        self.zoom_label.adjustSize()
+        self._position_zoom_label()
+
+    # ---- Zoom & Pan Mechanics ----
+    def wheelEvent(self, event) -> None:
+        """Mouse-wheel cursor-centric zooming."""
+        zoom_in_factor = 1.15
+        zoom_out_factor = 1.0 / zoom_in_factor
+
+        # Store mouse position in scene coordinates before zooming
+        old_scene_pos = self.mapToScene(event.pos())
+
+        if event.angleDelta().y() > 0:
+            zoom_factor = zoom_in_factor
         else:
-            super().keyPressEvent(event)
-    def _show_context_menu_for_selected(self):
-        selected_items = self.scene.selectedItems()
-        if not selected_items:
-            return
-        item = selected_items[0]
-        if isinstance(item, EdgeGraphicsItem):
-            center = (item._line_start + item._line_end) /2 
-            view_pos = self.mapFromScene(center)
-            self._show_edge_context_menu(view_pos,item)
+            zoom_factor = zoom_out_factor
+
+        self.scale(zoom_factor, zoom_factor)
+
+        # Get mouse position in scene coordinates after zooming
+        new_scene_pos = self.mapToScene(event.pos())
+
+        # Translate the view back to lock the cursor onto the scene point
+        delta = old_scene_pos - new_scene_pos
+        self.translate(-delta.x(), -delta.y())
+
+        self._update_zoom_indicator()
+    # ---- load / save (no dialogs, no message boxes — that's main_window's job) ----
+
     def load_json(self, path: str) -> None:
         harness = Harness.load_json(path)  # let exceptions propagate to the caller
         self.harness = harness
@@ -646,151 +693,6 @@ class HarnessGraphicsView(QGraphicsView):
         self.current_path = path
 
     # ---- rendering ----
-    def _show_context_menu(self, pos) -> None:
-        """Show context menu on right-click."""
-        # Convert viewport position to scene position
-        scene_pos = self.mapToScene(pos)
-        
-        # Get items at the scene position - use a small tolerance
-        # itemAt uses the exact position, so we need to check with a small area
-        items = self.scene.items(scene_pos)
-        # Filter to find the first interactive item (edge or route point)
-        target_item = None
-        for item in items:
-            if isinstance(item, EdgeGraphicsItem):
-                target_item = item
-                break
-            elif isinstance(item, RoutePointGraphicsItem):
-                target_item = item
-                break
-            elif isinstance(item, EdgeLengthLabel):
-                # If we clicked on the label, get its parent edge
-                target_item = item.parentItem()
-                break
-            elif isinstance(item, LengthFixArrowItem):
-                # If we clicked on an arrow, get its parent edge
-                target_item = item.parentItem()
-                break
-        
-        if target_item is None:
-            # If no item found at exact position, try a small area search
-            # Use items() with a small rectangle to find nearby items
-            search_rect = QRectF(scene_pos - QPointF(5, 5), QPointF(10, 10))
-            items = self.scene.items(search_rect)
-            for item in items:
-                if isinstance(item, EdgeGraphicsItem):
-                    target_item = item
-                    break
-                elif isinstance(item, RoutePointGraphicsItem):
-                    target_item = item
-                    break
-        
-        if isinstance(target_item, EdgeGraphicsItem):
-            self._show_edge_context_menu(pos, target_item)
-        elif isinstance(target_item, RoutePointGraphicsItem):
-            self._show_point_context_menu(pos, target_item)
-        elif isinstance(target_item, NodeGraphicsItem):
-            self._show_node_context_menu(pos, target_item)
-
-    
-    def _show_edge_context_menu(self, pos, edge_item: EdgeGraphicsItem) -> None:
-        menu = QMenu(self)
-        
-        add_branch_action = menu.addAction("Add Branch Point")
-        add_branch_action.triggered.connect(
-            lambda: self._add_point_at_cursor(pos, edge_item, PointType.BRANCH)
-        )
-        
-        add_layout_action = menu.addAction("Add Layout Point")
-        add_layout_action.triggered.connect(
-            lambda: self._add_point_at_cursor(pos, edge_item, PointType.LAYOUT)
-        )
-        
-        menu.exec_(self.mapToGlobal(pos))
-    
-    def _show_point_context_menu(self, pos, point_item: RoutePointGraphicsItem) -> None:
-        menu = QMenu(self)
-        
-        if point_item.is_branch:
-            merge_action = menu.addAction("Merge Branch Point")
-            merge_action.triggered.connect(
-                lambda: self._merge_branch_point(point_item)
-            )
-            menu.addSeparator()
-        
-        delete_action = menu.addAction("Delete Point")
-        delete_action.triggered.connect(
-            lambda: self._delete_route_point(point_item)
-        )
-        
-        menu.exec_(self.mapToGlobal(pos))
-    
-    def _add_point_at_cursor(self, pos, edge_item: EdgeGraphicsItem, point_type: PointType) -> None:
-        """Add a route point at the cursor position on an edge."""
-        if self.harness is None or self.parent.controller is None:
-            return
-        
-        # Convert screen position to scene position
-        scene_pos = self.mapToScene(pos)
-        
-        # Find nearest point on the edge
-        edge = edge_item.edge
-        start_pos = self.node_items[edge.start_node_id].pos()
-        end_pos = self.node_items[edge.end_node_id].pos()
-        
-        # Project cursor onto edge line segment
-        dx = end_pos.x() - start_pos.x()
-        dy = end_pos.y() - start_pos.y()
-        length = math.hypot(dx, dy)
-        if length < 1e-6:
-            return
-        
-        t = ((scene_pos.x() - start_pos.x()) * dx + (scene_pos.y() - start_pos.y()) * dy) / (length * length)
-        t = max(0, min(1, t))  # Clamp to segment
-        
-        point_pos = QPointF(
-            start_pos.x() + t * dx,
-            start_pos.y() + t * dy
-        )
-        
-        # Create the point
-        point_id = f"{edge.edge_id}_point_{len(self.harness.route_points) + 1}"
-        point = RoutePoint(
-            point_id=point_id,
-            point_type=point_type,
-            edge_id=edge.edge_id,
-            position=(point_pos.x(), point_pos.y(), 0),
-            label=f"Point {len(self.harness.route_points) + 1}",
-        )
-        
-        # Add to model through controller
-        self.parent.controller.add_route_point(point)
-    
-    def _merge_branch_point(self, point_item: RoutePointGraphicsItem) -> None:
-        """Merge a branch point back into its edge."""
-        if self.harness is None or self.parent.controller is None:
-            return
-        
-        # Confirm with user
-        reply = QMessageBox.question(
-            self, "Merge Branch Point",
-            f"Merge branch point {point_item.point.point_id}?",
-            QMessageBox.Yes | QMessageBox.No
-        )
-        if reply == QMessageBox.Yes:
-            self.parent.controller.merge_branch_point(point_item.point.point_id)
-    
-    def _delete_route_point(self, point_item: RoutePointGraphicsItem) -> None:
-        """Delete a route point (layout points only - branch points must be merged)."""
-        if point_item.is_branch:
-            QMessageBox.warning(
-                self, "Cannot Delete",
-                "Branch points must be merged before deletion."
-            )
-            return
-        
-        if self.parent.controller is not None:
-            self.parent.controller.delete_route_point(point_item.point.point_id)
 
     def _compute_layout(self) -> dict:
         """Return {node_id: QPointF}. Uses explicit Node.position where present,
@@ -812,7 +714,6 @@ class HarnessGraphicsView(QGraphicsView):
         self.scene.clear()
         self.node_items.clear()
         self.edge_items.clear()
-        self.route_point_items.clear()
         self.highlighted_wire_ids.clear()  # a freshly loaded document starts with nothing highlighted
         if self.harness is None:
             return
@@ -835,20 +736,105 @@ class HarnessGraphicsView(QGraphicsView):
             edge_item = EdgeGraphicsItem(edge, start_item, end_item)
             self.scene.addItem(edge_item)
             self.edge_items[edge.edge_id] = edge_item
-        for point in self.harness.route_points.values():
-            edge_item = self.edge_items.get(point.edge_id)
-            if edge_item is None:
-                continue
-            point_item = RoutePointGraphicsItem(point, edge_item)
-            point_item.setPos(QPointF(point.position[0], point.position[1]))
-            self.scene.addItem(point_item)
-            self.route_point_items[point.point_id] = point_item
 
         self.scene.setSceneRect(self.scene.itemsBoundingRect().adjusted(-40, -40, 40, 40))
         self.fitInView(self.scene.sceneRect(), Qt.KeepAspectRatio)
 
         self.sceneRebuilt.emit()
+    def mousePressEvent(self, event) -> None:
+        """Middle click initiates canvas panning."""
+        if event.button() == Qt.MiddleButton:
+            self._pan_start = event.pos()
+            self.setCursor(Qt.ClosedHandCursor)
+            event.accept()
+            return
+        super().mousePressEvent(event) 
 
+    def mouseMoveEvent(self, event) -> None:
+        """Handles background panning translation by shifting scrollbars."""
+        if self._pan_start is not None:
+            delta = event.pos() - self._pan_start
+            self._pan_start = event.pos()
+            self.horizontalScrollBar().setValue(self.horizontalScrollBar().value() - delta.x())
+            self.verticalScrollBar().setValue(self.verticalScrollBar().value() - delta.y())
+            event.accept()
+            return
+        super().mouseMoveEvent(event) 
+
+    def mouseReleaseEvent(self, event) -> None:
+        if event.button() == Qt.MiddleButton:
+            self._pan_start = None
+            self.setCursor(Qt.ArrowCursor)
+            event.accept()
+            return
+        super().mouseReleaseEvent(event) 
+
+    # ---- Adaptive Background Grid ----
+    def drawBackground(self, painter: QPainter, rect: QRectF) -> None:
+        if not getattr(self, 'grid_enabled', True):
+            super().drawBackground(painter, rect)
+            return
+
+        painter.save() 
+        painter.setRenderHint(QPainter.Antialiasing, False)  # Keeps grid lines pixel-sharp
+
+        scale = self.transform().m11()
+        target_screen_step = 50.0  # Aim for lines roughly ~50px apart on screen
+        raw_step = target_screen_step / scale
+
+        if raw_step <= 0:
+            painter.restore() 
+            return
+
+        # Decimal Subdivision Algorithm (AutoCAD & Fusion 360 Style)
+        power = math.floor(math.log10(raw_step))
+        base = 10 ** power
+        ratio = raw_step / base
+
+        if ratio < 2:
+            grid_step = base
+        elif ratio < 5:
+            grid_step = base * 2
+        else:
+            grid_step = base * 5
+
+        # Align view loop thresholds to current grid scale
+        left = math.floor(rect.left() / grid_step) * grid_step
+        right = math.ceil(rect.right() / grid_step) * grid_step
+        top = math.floor(rect.top() / grid_step) * grid_step
+        bottom = math.ceil(rect.bottom() / grid_step) * grid_step
+
+        # Cosmetic pens prevent lines from scaling into massive blocks when zooming in
+        minor_pen = QPen(QColor("#E5E7EB"), 1)
+        minor_pen.setCosmetic(True)
+        painter.setPen(minor_pen) 
+
+        # Draw Adaptive Minor Grid Lines
+        x = left
+        while x <= right:
+            painter.drawLine(QPointF(x, rect.top()), QPointF(x, rect.bottom())) 
+            x += grid_step
+        y = top
+        while y <= bottom:
+            painter.drawLine(QPointF(rect.left(), y), QPointF(rect.right(), y)) 
+            y += grid_step
+
+        # Draw Major Accent Grid Lines (Every 5 subdivisions)
+        major_step = grid_step * 5
+        major_pen = QPen(QColor("#D1D5DB"), 1.5)
+        major_pen.setCosmetic(True)
+        painter.setPen(major_pen) 
+
+        x = math.floor(rect.left() / major_step) * major_step
+        while x <= right:
+            painter.drawLine(QPointF(x, rect.top()), QPointF(x, rect.bottom())) 
+            x += major_step
+        y = math.floor(rect.top() / major_step) * major_step
+        while y <= bottom:
+            painter.drawLine(QPointF(rect.left(), y), QPointF(rect.right(), y)) 
+            y += major_step
+
+        painter.restore() 
     # ---- targeted refresh (used by the controller after a model change) ----
 
     def refresh_entity(self, entity_kind: str, entity_id: str) -> None:
@@ -909,119 +895,42 @@ class HarnessGraphicsView(QGraphicsView):
         edge_item.start_item.unregister_edge(edge_item)
         edge_item.end_item.unregister_edge(edge_item)
         self.scene.removeItem(edge_item)
-        
-class RoutePointGraphicsItem(QGraphicsObject):
-    """A point along an edge - either a branch point (can have connections)
-    or a layout point (routing aid)."""
-    
-    # Emitted when this point is moved
-    moveFinished = pyqtSignal(str, QPointF, QPointF)
-    
-    def __init__(self, point: RoutePoint, edge_item: "EdgeGraphicsItem",
-                 parent: Optional[QGraphicsItem] = None):
-        super().__init__(parent)
-        self.point = point
-        self.edge_item = edge_item
-        self.is_branch = point.point_type == PointType.BRANCH
-        
-        self.setFlag(QGraphicsItem.ItemIsSelectable, True)
-        self.setFlag(QGraphicsItem.ItemIsMovable, True)
-        self.setFlag(QGraphicsItem.ItemSendsGeometryChanges, True)
-        
-        if self.is_branch:
-            self.setToolTip(f"Branch: {point.point_id}\n{point.label}")
-        else:
-            self.setToolTip(f"Layout: {point.point_id}")
-        
-        # Label for the point
-        self.label_item = QGraphicsTextItem(point.label or point.point_id, self)
-        self.label_item.setDefaultTextColor(LABEL_COLOR)
-        label_rect = self.label_item.boundingRect()
-        r = BRANCH_POINT_RADIUS if self.is_branch else LAYOUT_POINT_RADIUS
-        self.label_item.setPos(-label_rect.width() / 2, r + 4)
-        
-        self._press_pos: Optional[QPointF] = None
-    
-    def boundingRect(self) -> QRectF:
-        r = BRANCH_POINT_RADIUS if self.is_branch else LAYOUT_POINT_RADIUS
-        pad = NODE_PEN.widthF()
-        return QRectF(-r - pad, -r - pad, 2*(r + pad), 2*(r + pad))
-    
-    def shape(self) -> QPainterPath:
-        path = QPainterPath()
-        r = BRANCH_POINT_RADIUS if self.is_branch else LAYOUT_POINT_RADIUS
-        if self.is_branch:
-            # Branch point: diamond
-            path.addPolygon(QPolygonF([
-                QPointF(0, -r),
-                QPointF(r, 0),
-                QPointF(0, r),
-                QPointF(-r, 0),
-            ]))
-            path.closeSubpath()
-        else:
-            # Layout point: small circle with cross
-            path.addEllipse(QPointF(0, 0), r, r)
-        return path
-    
-    def paint(self, painter, option: QStyleOptionGraphicsItem, 
-              widget: Optional[QWidget] = None) -> None:
-        color = BRANCH_POINT_COLOR if self.is_branch else LAYOUT_POINT_COLOR
-        r = BRANCH_POINT_RADIUS if self.is_branch else LAYOUT_POINT_RADIUS
-        
-        if self.is_branch:
-            # Diamond
-            pen = QPen(QColor("#222222"), 1.5)
-            painter.setBrush(QBrush(color))
-            painter.setPen(pen)
-            painter.drawPolygon(QPolygonF([
-                QPointF(0, -r),
-                QPointF(r, 0),
-                QPointF(0, r),
-                QPointF(-r, 0),
-            ]))
-        else:
-            # Circle with cross
-            pen = QPen(QColor("#222222"), 1.5)
-            painter.setBrush(QBrush(color))
-            painter.setPen(pen)
-            painter.drawEllipse(QPointF(0, 0), r, r)
-            # Cross inside
-            painter.drawLine(QPointF(-r/2, 0), QPointF(r/2, 0))
-            painter.drawLine(QPointF(0, -r/2), QPointF(0, r/2))
-    
-    def itemChange(self, change, value):
-        if change == QGraphicsItem.ItemPositionChange and self._press_pos is not None:
-            # Snap to grid during drag
-            return QPointF(_snap(value.x()), _snap(value.y()))
-        
-        if change == QGraphicsItem.ItemPositionHasChanged:
-            # Update the edge's line
-            self.edge_item.update_line()
-        
-        return super().itemChange(change, value)
-    
-    def mousePressEvent(self, event) -> None:
-        self._press_pos = QPointF(self.pos())
-        super().mousePressEvent(event)
-    
-    def mouseReleaseEvent(self, event) -> None:
-        super().mouseReleaseEvent(event)
-        if self._press_pos is not None:
-            old_pos, new_pos = self._press_pos, QPointF(self.pos())
-            self._press_pos = None
-            if old_pos != new_pos:
-                self.moveFinished.emit(self.point.point_id, old_pos, new_pos)
-    
-    def refresh_from_model(self) -> None:
-        self.label_item.setPlainText(self.point.label or self.point.point_id)
-        label_rect = self.label_item.boundingRect()
-        r = BRANCH_POINT_RADIUS if self.is_branch else LAYOUT_POINT_RADIUS
-        self.label_item.setPos(-label_rect.width() / 2, r + 4)
-        self.update()
 
-    def setPos(self, pos: QPointF) -> None:
-        # Override to keep the point on the edge
-        super().setPos(pos)
-        # Update the point's position in the model
-        self.point.position = (pos.x(), pos.y(), 0)
+    # ---- incremental node add/remove (used by the controller's edge-split
+    # command — adding a branch/layout point shouldn't require a full
+    # scene rebuild) ----
+
+    def add_node_item(self, node: Node) -> NodeGraphicsItem:
+        item = NodeGraphicsItem(node)
+        pos = node.position or (0.0, 0.0)
+        item.setPos(pos[0], pos[1])
+        self.scene.addItem(item)
+        self.node_items[node.node_id] = item
+        return item
+
+    def remove_node_item(self, node_id: str) -> None:
+        item = self.node_items.pop(node_id, None)
+        if item is None:
+            return
+        self.scene.removeItem(item)
+
+    def reassign_edge_endpoint(self, edge_id: str, end: str, new_node_id: str) -> None:
+        """Structurally rewire which node an edge's start/end connects to
+        — NOT the same as a field update. Used when splitting an edge:
+        the original edge's end_node_id changes to point at the new
+        branch/layout point, so the EdgeGraphicsItem needs to swap which
+        NodeGraphicsItem it's actually anchored to (and re-register with
+        it), not just repaint."""
+        edge_item = self.edge_items.get(edge_id)
+        new_node_item = self.node_items.get(new_node_id)
+        if edge_item is None or new_node_item is None:
+            return
+        if end == "start":
+            edge_item.start_item.unregister_edge(edge_item)
+            edge_item.start_item = new_node_item
+            new_node_item.register_edge(edge_item)
+        else:
+            edge_item.end_item.unregister_edge(edge_item)
+            edge_item.end_item = new_node_item
+            new_node_item.register_edge(edge_item)
+        edge_item.update_line()

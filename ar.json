@@ -7,8 +7,8 @@
       "node_type": "connector",
       "label": "STVB 01",
       "position": [
-        -9.654575824487964,
-        -148.304547985374
+        0.38975457150168324,
+        -184.3847261368626
       ],
       "metadata": {}
     },
@@ -81,7 +81,7 @@
       "length_mm": 100.0,
       "max_diameter_mm": 8.5,
       "bend_radius_mm": 25.0,
-      "length_locked": false,
+      "length_locked": true,
       "metadata": {}
     },
     {
@@ -254,19 +254,6 @@
       "route_edge_ids": [
         "SEG_AUTO_3"
       ],
-      "metadata": {}
-    }
-  ],
-  "route_points": [
-    {
-      "point_id": "SEG_AUTO_2_point_1",
-      "point_type": "branch",
-      "edge_id": "SEG_AUTO_2",
-      "position": [
-        170.0,
-        -205.0
-      ],
-      "label": "Point 1",
       "metadata": {}
     }
   ]

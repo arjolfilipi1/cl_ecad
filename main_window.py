@@ -27,7 +27,7 @@ from PyQt5.QtCore import Qt
 from harness_view import HarnessGraphicsView
 from harness_controller import HarnessController
 from wires_panel import WiresTab
-
+from settings_dialog import SettingsDialog
 
 class MainWindow(QMainWindow):
     def __init__(self, initial_path: Optional[str] = None):
@@ -39,7 +39,7 @@ class MainWindow(QMainWindow):
 
         # Controller derives its model reference from the view and keeps
         # itself in sync across reloads (see harness_controller.py).
-        self.controller = HarnessController(self.view)
+        self.controller = HarnessController(self.view,self)
 
         # Left panel: a QTabWidget so more tabs (Nodes, Edges, BOM, ...)
         # can be added later alongside Wires.
@@ -86,7 +86,10 @@ class MainWindow(QMainWindow):
         save_as_action.setShortcut(QKeySequence.SaveAs)
         save_as_action.triggered.connect(self.on_save_as)
         file_menu.addAction(save_as_action)
-
+        
+        settings_action = QAction("Settings...", self)
+        settings_action.triggered.connect(self.open_settings)
+        file_menu.addAction(settings_action)
         # Undo/redo actions come straight from the QUndoStack. Qt keeps
         # their label ("Undo Move CONN_A") and enabled state in sync
         # automatically — no manual bookkeeping needed here.
@@ -108,7 +111,10 @@ class MainWindow(QMainWindow):
         toolbar.addAction(self.redo_action)
 
     # ---- file actions ----
-
+    def open_settings(self) -> None:
+        """Opens the application settings dialog."""
+        dialog = SettingsDialog(self)
+        dialog.exec_()
     def on_open(self) -> None:
         path, _ = QFileDialog.getOpenFileName(self, "Open Harness JSON", "", "JSON Files (*.json)")
         if path:

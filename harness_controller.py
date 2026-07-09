@@ -35,9 +35,9 @@ import math
 from typing import Any, Optional
 
 from PyQt5.QtCore import QObject, QPointF, pyqtSignal
-from PyQt5.QtWidgets import QUndoCommand, QUndoStack
+from PyQt5.QtWidgets import QUndoCommand, QUndoStack,QDialog
 
-from harness_model import Harness, Edge, Wire
+from harness_model import Harness, Node, Edge, Wire, NodeType, BRANCH_MERGE_DISTANCE_MM
 from harness_routing import find_route, estimate_direct_length
 
 
@@ -65,7 +65,8 @@ class MoveNodeCommand(QUndoCommand):
 
 class AddEdgeCommand(QUndoCommand):
     """Undoable creation of a new Edge (used for the direct-segment
-    fallback when Dijkstra routing finds no existing path)."""
+    fallback when Dijkstra routing finds no existing path, and for the
+    two new segments created when an edge is split)."""
 
     def __init__(self, controller: "HarnessController", edge: Edge):
         super().__init__(f"Add edge {edge.edge_id}")
@@ -78,45 +79,111 @@ class AddEdgeCommand(QUndoCommand):
     def undo(self) -> None:
         self.controller._apply_remove_edge(self.edge.edge_id)
 
-class AddRoutePointCommand(QUndoCommand):
-    def __init__(self, controller: "HarnessController", point: RoutePoint):
-        super().__init__(f"Add {point.point_type.value} point {point.point_id}")
-        self.controller = controller
-        self.point = point
-    
-    def redo(self) -> None:
-        self.controller._apply_add_route_point(self.point)
-    
-    def undo(self) -> None:
-        self.controller._apply_delete_route_point(self.point.point_id)
 
-class MergeBranchPointCommand(QUndoCommand):
-    def __init__(self, controller: "HarnessController", point_id: str):
-        super().__init__(f"Merge branch point {point_id}")
-        self.controller = controller
-        self.point_id = point_id
-    
-    def redo(self) -> None:
-        self.controller._apply_merge_branch_point(self.point_id)
-    
-    def undo(self) -> None:
-        # Undo merge by re-splitting the edge
-        # This is complex - store the split state
-        pass
+class DeleteEdgeCommand(QUndoCommand):
+    """Undoable deletion of an existing Edge — the inverse of
+    AddEdgeCommand. Used when splitting an edge (the original edge is
+    deleted and replaced by two new ones)."""
 
-class DeleteRoutePointCommand(QUndoCommand):
-    def __init__(self, controller: "HarnessController", point_id: str):
-        super().__init__(f"Delete layout point {point_id}")
+    def __init__(self, controller: "HarnessController", edge: Edge):
+        super().__init__(f"Delete edge {edge.edge_id}")
         self.controller = controller
-        self.point_id = point_id
-    
-    def redo(self) -> None:
-        self.controller._apply_delete_route_point(self.point_id)
-    
-    def undo(self) -> None:
-        # Re-add the point
-        pass
+        self.edge = edge  # kept so undo can re-add it exactly as it was
 
+    def redo(self) -> None:
+        self.controller._apply_remove_edge(self.edge.edge_id)
+
+    def undo(self) -> None:
+        self.controller._apply_add_edge(self.edge)
+
+
+class AddNodeCommand(QUndoCommand):
+    """Undoable creation of a new Node (used for branch/layout points
+    added by splitting an edge)."""
+
+    def __init__(self, controller: "HarnessController", node: Node):
+        super().__init__(f"Add {node.node_type.value} {node.node_id}")
+        self.controller = controller
+        self.node = node
+
+    def redo(self) -> None:
+        self.controller._apply_add_node(self.node)
+
+    def undo(self) -> None:
+        self.controller._apply_remove_node(self.node.node_id)
+
+
+class MergeBranchPointsCommand(QUndoCommand):
+    """Undoable structural merge of one BRANCH_POINT onto another.
+    Reassigns external edges to the target, swallows connecting edges,
+    and hides the moved node while retaining its data for unmerging."""
+
+    def __init__(self, controller: "HarnessController", moved_node_id: str, target_node_id: str,
+                 pre_merge_pos: tuple, target_pos: tuple, old_metadata: dict):
+        super().__init__(f"Merge {moved_node_id} into {target_node_id}")
+        self.controller = controller
+        self.moved_node_id = moved_node_id
+        self.target_node_id = target_node_id
+        self.pre_merge_pos = pre_merge_pos
+        self.target_pos = target_pos
+        self.old_metadata = old_metadata
+
+        self.edges_to_reassign = []  # [(edge_id, field_name_to_change)]
+        self.edges_to_swallow = []   # [Edge objects]
+        self.wires_to_update = []    # [(wire_id, old_route, new_route)]
+
+        # Analyze topology to determine what happens to the edges
+        for edge in list(controller.harness.edges.values()):
+            if self.moved_node_id in (edge.start_node_id, edge.end_node_id):
+                other_node = edge.end_node_id if edge.start_node_id == self.moved_node_id else edge.start_node_id
+                
+                if other_node == self.target_node_id:
+                    # Edge connects the two merging nodes directly; swallow it
+                    self.edges_to_swallow.append(edge)
+                else:
+                    # Edge goes somewhere else; re-anchor it to the target
+                    field = "start_node_id" if edge.start_node_id == self.moved_node_id else "end_node_id"
+                    self.edges_to_reassign.append((edge.edge_id, field))
+
+        # Analyze wires passing through swallowed edges
+        swallow_ids = {e.edge_id for e in self.edges_to_swallow}
+        if swallow_ids:
+            for wire in controller.harness.wires.values():
+                if any(eid in swallow_ids for eid in wire.route_edge_ids):
+                    new_route = [eid for eid in wire.route_edge_ids if eid not in swallow_ids]
+                    self.wires_to_update.append((wire.wire_id, list(wire.route_edge_ids), new_route))
+
+    def redo(self) -> None:
+        # 1. Update wire routes to bypass the edges we are about to swallow
+        for wire_id, _, new_route in self.wires_to_update:
+            self.controller._apply_field("wire", wire_id, "route_edge_ids", new_route)
+
+        # 2. Remove swallowed edges from the active graph
+        for edge in self.edges_to_swallow:
+            self.controller._apply_remove_edge(edge.edge_id)
+
+        # 3. Re-anchor remaining edges to the target node
+        for edge_id, field in self.edges_to_reassign:
+            self.controller._apply_field("edge", edge_id, field, self.target_node_id)
+
+        # 4. Update the merged node metadata (This makes it invisible via the view refresh)
+        self.controller._apply_merge(self.moved_node_id, self.target_node_id, self.target_pos, self.pre_merge_pos)
+
+    def undo(self) -> None:
+        # 1. Un-ghost the node by restoring old metadata
+        self.controller._apply_unmerge(self.moved_node_id, self.pre_merge_pos, self.old_metadata)
+
+        # 2. Re-anchor edges back to the original node
+        for edge_id, field in self.edges_to_reassign:
+            self.controller._apply_field("edge", edge_id, field, self.moved_node_id)
+
+        # 3. Restore swallowed edges back to the graph
+        for edge in self.edges_to_swallow:
+            self.controller._apply_add_edge(edge)
+
+        # 4. Restore original wire routes
+        for wire_id, old_route, _ in self.wires_to_update:
+            self.controller._apply_field("wire", wire_id, "route_edge_ids", old_route)
 
 
 class AddWireCommand(QUndoCommand):
@@ -178,7 +245,12 @@ class HarnessController(QObject):
     # Same idea, for edges — fires when Dijkstra routing has to fall back
     # to creating a brand new direct edge.
     edgeListChanged = pyqtSignal()
-    pointListChanged = pyqtSignal()  # New signal for points list changes
+
+    # Same idea, for nodes — fires when a branch/layout point is added or
+    # removed (e.g. by splitting an edge). No Nodes tab consumes this yet,
+    # but it's here for when one exists.
+    nodeListChanged = pyqtSignal()
+
     def __init__(self, view, parent: Optional[QObject] = None):
         super().__init__(parent)
         self.view = view
@@ -213,10 +285,33 @@ class HarnessController(QObject):
             node_item.moveFinished.connect(self._on_node_move_finished)
         for edge_item in self.view.edge_items.values():
             edge_item.fixLengthRequested.connect(self._on_fix_length_requested)
-        for point_item in self.view.route_point_items.values():
-            point_item.moveFinished.connect(self._on_point_move_finished)
-
+            edge_item.splitRequested.connect(self._on_split_requested)
+            edge_item.editRequested.connect(self._on_edge_edit_requested)
     # ---- scene -> model (change interception) ----
+    def _on_edge_edit_requested(self, edge_id: str) -> None:
+        """Open the edge edit dialog for the given edge."""
+        # Find the main window - could use a signal or go up the hierarchy
+        # Option: Use the parent chain to find MainWindow
+        parent = self.parent()
+        while parent:
+            if hasattr(parent, 'edges_tab') and hasattr(parent, 'view'):
+                # We found the main window
+                main_window = parent
+                # The edges tab has refresh, but we need to open the edit dialog
+                # We can open it directly
+                print(edge_id)
+                edge = self.harness.edges.get(edge_id)
+                if edge is not None:
+                    from wires_panel import EditEdgeDialog
+                    dialog = EditEdgeDialog(edge, self.harness, main_window)
+                    if dialog.exec() == QDialog.Accepted:
+                        updated_values = dialog.get_updated_values()
+                        for field_name, new_value in updated_values.items():
+                            old_value = getattr(edge, field_name)
+                            if old_value != new_value:
+                                self.set_edge_field(edge_id, field_name, new_value)
+                return
+            parent = parent.parent()
 
     def _on_node_move_finished(self, node_id: str, old_pos: QPointF, new_pos: QPointF) -> None:
         if self._applying:
@@ -227,36 +322,32 @@ class HarnessController(QObject):
         if old_pos_tuple == new_pos_tuple:
             return  # no real movement
 
+        node = self.harness.nodes[node_id]
+        if node.node_type == NodeType.BRANCH_POINT:
+            target_id = self._find_merge_target(node_id, new_pos_tuple)
+            if target_id is not None:
+                target_pos = self.harness.nodes[target_id].position
+                self.undo_stack.push(MergeBranchPointsCommand(
+                    self, node_id, target_id, old_pos_tuple, tuple(target_pos), dict(node.metadata)
+                ))
+                return
+
         self.undo_stack.push(MoveNodeCommand(self, node_id, old_pos_tuple, new_pos_tuple))
-    def _on_point_move_finished(self, point_id: str, old_pos: QPointF, new_pos: QPointF) -> None:
-        """Handle a route point being moved."""
-        if self._applying:
-            return
-        
-        old_tuple = (old_pos.x(), old_pos.y())
-        new_tuple = (new_pos.x(), new_pos.y())
-        if old_tuple == new_tuple:
-            return
-        
-        # Update the model
-        point = self.harness.route_points[point_id]
-        point.position = new_tuple
-        self.modelChanged.emit("point", point_id)
-    
-    def add_route_point(self, point: RoutePoint) -> None:
-        """Add a route point (branch or layout)."""
-        self.undo_stack.push(AddRoutePointCommand(self, point))
-    
-    def merge_branch_point(self, point_id: str) -> None:
-        """Merge a branch point back into its edge."""
-        self.undo_stack.push(MergeBranchPointCommand(self, point_id))
-    
-    def delete_route_point(self, point_id: str) -> None:
-        """Delete a layout point (branch points must be merged first)."""
-        point = self.harness.route_points[point_id]
-        if point.point_type == PointType.BRANCH:
-            raise ValueError("Branch points must be merged before deletion")
-        self.undo_stack.push(DeleteRoutePointCommand(self, point_id))
+
+    def _find_merge_target(self, moving_node_id: str, position: tuple) -> Optional[str]:
+        """Closest OTHER branch point within BRANCH_MERGE_DISTANCE_MM, if
+        any (mirrors NodeGraphicsItem._nearby_branch_point's live preview,
+        so what turned green during the drag is exactly what merges)."""
+        mx, my = position
+        best_id, best_dist = None, BRANCH_MERGE_DISTANCE_MM
+        for nid, n in self.harness.nodes.items():
+            if nid == moving_node_id or n.node_type != NodeType.BRANCH_POINT or n.position is None:
+                continue
+            dist = math.hypot(n.position[0] - mx, n.position[1] - my)
+            if dist <= best_dist:
+                best_dist = dist
+                best_id = nid
+        return best_id
 
     def _on_fix_length_requested(self, edge_id: str, side: str) -> None:
         """One of an edge's fix-length arrows was clicked. Rigid-translate
@@ -327,6 +418,85 @@ class HarnessController(QObject):
                     visited.add(neighbor)
                     stack.append(neighbor)
         return visited
+
+    # ---- edge splitting (Add Branch Point / Add Layout Point) ----
+
+    def _on_split_requested(self, edge_id: str, scene_pos: QPointF, node_type_value: str) -> None:
+        self.split_edge(edge_id, scene_pos, NodeType(node_type_value))
+
+    def split_edge(self, edge_id: str, scene_pos: QPointF, node_type: NodeType) -> None:
+        """Interrupt an edge with a new node at (approximately) scene_pos,
+        splitting it into two edges that meet there. Used for both branch
+        points (future connection/fastener anchors) and layout points
+        (routing/visual only) — they differ only in node_type. This is
+        also how an edge ends up visually "bent": a layout point is just
+        an ordinary node, so two straight edges meeting at it look like
+        one bent path, with no separate polyline concept needed.
+
+        The click position is projected onto the edge's current straight
+        line (clamped away from the exact endpoints) rather than used
+        verbatim, so the new node always sits exactly on the line.
+        length_mm is split proportionally to where along the line that
+        projection falls, so the two halves sum back to the original
+        length exactly."""
+        edge = self.harness.edges[edge_id]
+        start_pos = self.harness.nodes[edge.start_node_id].position
+        end_pos = self.harness.nodes[edge.end_node_id].position
+        if start_pos is None or end_pos is None:
+            return
+
+        sx, sy = start_pos[0], start_pos[1]
+        ex, ey = end_pos[0], end_pos[1]
+        vx, vy = ex - sx, ey - sy
+        seg_len_sq = vx * vx + vy * vy
+        if seg_len_sq < 1e-9:
+            t = 0.5
+        else:
+            wx, wy = scene_pos.x() - sx, scene_pos.y() - sy
+            t = (vx * wx + vy * wy) / seg_len_sq
+            t = min(max(t, 0.05), 0.95)  # keep the new node off the exact endpoints
+        split_x, split_y = sx + vx * t, sy + vy * t
+
+        prefix = "BRANCH_" if node_type == NodeType.BRANCH_POINT else "LAYOUT_"
+        new_node_id = self._generate_id(prefix, self.harness.nodes)
+        new_node = Node(node_id=new_node_id, node_type=node_type, label=new_node_id,
+                         position=(split_x, split_y))
+
+        new_edge_id = self._generate_id("SEG_SPLIT_", self.harness.edges)
+        old_end_id = edge.end_node_id
+        old_length = edge.length_mm
+        length_1 = old_length * t
+        length_2 = old_length - length_1
+
+        new_edge = Edge(
+            edge_id=new_edge_id,
+            start_node_id=new_node_id,
+            end_node_id=old_end_id,
+            length_mm=length_2,
+            max_diameter_mm=edge.max_diameter_mm,
+            bend_radius_mm=edge.bend_radius_mm,
+            length_locked=edge.length_locked,
+        )
+
+        self.undo_stack.beginMacro(f"Add {node_type.value} on {edge_id}")
+        self.undo_stack.push(AddNodeCommand(self, new_node))
+        self.undo_stack.push(SetFieldCommand(self, "edge", edge_id, "end_node_id", old_end_id, new_node_id))
+        self.undo_stack.push(SetFieldCommand(self, "edge", edge_id, "length_mm", old_length, length_1))
+        self.undo_stack.push(AddEdgeCommand(self, new_edge))
+
+        # Keep any wire that was routed through the original edge
+        # physically continuous — it now needs to also pass through the
+        # new segment to still reach its original destination.
+        for wire in self.harness.wires.values():
+            if edge_id in wire.route_edge_ids:
+                old_route = list(wire.route_edge_ids)
+                idx = old_route.index(edge_id)
+                new_route = old_route[:idx + 1] + [new_edge_id] + old_route[idx + 1:]
+                self.undo_stack.push(SetFieldCommand(
+                    self, "wire", wire.wire_id, "route_edge_ids", old_route, new_route,
+                    description=f"Extend {wire.wire_id} route through {new_edge_id}",
+                ))
+        self.undo_stack.endMacro()
 
     # ---- public API for editors not built yet (rename dialogs, property panels) ----
 
@@ -428,10 +598,13 @@ class HarnessController(QObject):
         )
 
     def _generate_edge_id(self) -> str:
+        return self._generate_id("SEG_AUTO_", self.harness.edges)
+
+    def _generate_id(self, prefix: str, existing: dict) -> str:
         n = 1
-        while f"SEG_AUTO_{n}" in self.harness.edges:
+        while f"{prefix}{n}" in existing:
             n += 1
-        return f"SEG_AUTO_{n}"
+        return f"{prefix}{n}"
 
     # ---- command application: the ONLY place that mutates the model ----
 
@@ -452,6 +625,20 @@ class HarnessController(QObject):
     def _apply_field(self, entity_kind: str, entity_id: str, field_name: str, value: Any) -> None:
         entity = self._get_entity(entity_kind, entity_id)
         setattr(entity, field_name, value)
+
+        if entity_kind == "edge" and field_name in ("start_node_id", "end_node_id"):
+            # Not just a data change — the graphics item needs to be
+            # structurally rewired to a different NodeGraphicsItem, not
+            # just repainted (used when splitting an edge).
+            end = "start" if field_name == "start_node_id" else "end"
+            self.view.reassign_edge_endpoint(entity_id, end, value)
+
+        if entity_kind == "wire" and field_name == "route_edge_ids":
+            # A wire's path changed (e.g. extended through a new split
+            # segment) — if it's currently highlighted, the highlight
+            # needs to immediately reflect the updated route.
+            self.view._apply_highlights()
+
         self.modelChanged.emit(entity_kind, entity_id)
 
     def _apply_add_wire(self, wire) -> None:
@@ -472,12 +659,43 @@ class HarnessController(QObject):
         # added incrementally (e.g. the auto-route direct-edge fallback)
         # needs its own signal connected here.
         self.view.edge_items[edge.edge_id].fixLengthRequested.connect(self._on_fix_length_requested)
+        self.view.edge_items[edge.edge_id].splitRequested.connect(self._on_split_requested)
         self.edgeListChanged.emit()
 
     def _apply_remove_edge(self, edge_id: str) -> None:
         self.view.remove_edge_item(edge_id)
         del self.harness.edges[edge_id]
         self.edgeListChanged.emit()
+
+    def _apply_merge(self, moved_node_id: str, target_node_id: str, target_pos: tuple, pre_merge_pos: tuple) -> None:
+        node = self.harness.nodes[moved_node_id]
+        node.metadata["merged_into"] = target_node_id
+        node.metadata["pre_merge_position"] = list(pre_merge_pos)
+        # Position update goes through the normal path so the graphics
+        # item, undo-guard, and modelChanged signal all behave exactly
+        # like any other move.
+        self._apply_node_position(moved_node_id, target_pos)
+        self.view.refresh_entity("node", moved_node_id)  # picks up the merged-into tooltip text
+
+    def _apply_unmerge(self, moved_node_id: str, pre_merge_pos: tuple, old_metadata: dict) -> None:
+        node = self.harness.nodes[moved_node_id]
+        node.metadata = dict(old_metadata)
+        self._apply_node_position(moved_node_id, pre_merge_pos)
+        self.view.refresh_entity("node", moved_node_id)
+
+    def _apply_add_node(self, node: Node) -> None:
+        self.harness.add_node(node)
+        item = self.view.add_node_item(node)
+        # connect_scene() only re-wires signals on a full rebuild; a node
+        # added incrementally (splitting an edge) needs its own signal
+        # connected here so it can be dragged like any other node.
+        item.moveFinished.connect(self._on_node_move_finished)
+        self.nodeListChanged.emit()
+
+    def _apply_remove_node(self, node_id: str) -> None:
+        self.view.remove_node_item(node_id)
+        del self.harness.nodes[node_id]
+        self.nodeListChanged.emit()
 
     def _get_entity(self, entity_kind: str, entity_id: str):
         table = {
@@ -491,19 +709,3 @@ class HarnessController(QObject):
 
     def _on_model_changed(self, entity_kind: str, entity_id: str) -> None:
         self.view.refresh_entity(entity_kind, entity_id)
-    def _apply_add_route_point(self, point: RoutePoint) -> None:
-        self.harness.add_route_point(point)
-        self.view.add_route_point_item(point)
-        self.pointListChanged.emit()
-
-    def _apply_delete_route_point(self, point_id: str) -> None:
-        del self.harness.route_points[point_id]
-        self.view.remove_route_point_item(point_id)
-        self.pointListChanged.emit()
-
-    def _apply_merge_branch_point(self, point_id: str) -> None:
-        self.harness.merge_branch_point(point_id)
-        self.view.remove_route_point_item(point_id)
-        # Rebuild affected edges
-        self.view.render()  # Full rebuild for simplicity
-        self.pointListChanged.emit()
