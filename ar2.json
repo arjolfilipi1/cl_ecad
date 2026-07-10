@@ -7,8 +7,8 @@
       "node_type": "connector",
       "label": "STVB 01",
       "position": [
-        -29.999467056986674,
-        -180.2308549702835
+        -16.983865083720637,
+        -204.6017703319319
       ],
       "metadata": {}
     },
@@ -67,158 +67,14 @@
       "node_type": "splice",
       "label": "Inline Joint",
       "position": [
-        89.05122953440872,
-        -180.69918962325758
-      ],
-      "metadata": {}
-    },
-    {
-      "node_id": "BRANCH_1",
-      "node_type": "branch_point",
-      "label": "BRANCH_1",
-      "position": [
-        -20.0,
-        -90.0
-      ],
-      "metadata": {}
-    },
-    {
-      "node_id": "BRANCH_2",
-      "node_type": "branch_point",
-      "label": "BRANCH_2",
-      "position": [
-        20.0,
-        -180.0
-      ],
-      "metadata": {}
-    },
-    {
-      "node_id": "BRANCH_3",
-      "node_type": "branch_point",
-      "label": "BRANCH_3",
-      "position": [
-        190.0,
-        -210.0
-      ],
-      "metadata": {
-        "merged_into": "BRANCH_4",
-        "pre_merge_position": [
-          118.2886663759407,
-          -143.6101019966557
-        ]
-      }
-    },
-    {
-      "node_id": "BRANCH_4",
-      "node_type": "branch_point",
-      "label": "BRANCH_4",
-      "position": [
-        190.0,
-        -210.0
+        99.94515150647096,
+        -185.85969831729798
       ],
       "metadata": {}
     }
   ],
   "edges": [
-    {
-      "edge_id": "SEG_1",
-      "start_node_id": "STVB 01",
-      "end_node_id": "BRANCH_2",
-      "length_mm": 50.0,
-      "max_diameter_mm": 8.5,
-      "bend_radius_mm": 25.0,
-      "length_locked": true,
-      "metadata": {}
-    },
-    {
-      "edge_id": "SEG_2",
-      "start_node_id": "SPLICE_1",
-      "end_node_id": "BRANCH_4",
-      "length_mm": 43.08067551922402,
-      "max_diameter_mm": 6.0,
-      "bend_radius_mm": 18.0,
-      "length_locked": false,
-      "metadata": {}
-    },
-    {
-      "edge_id": "SEG_AUTO_1",
-      "start_node_id": "STVB 02",
-      "end_node_id": "BRANCH_1",
-      "length_mm": 34.32389512310618,
-      "max_diameter_mm": 0.0,
-      "bend_radius_mm": 0.0,
-      "length_locked": false,
-      "metadata": {
-        "auto_generated": true,
-        "direct": true
-      }
-    },
-    {
-      "edge_id": "SEG_AUTO_2",
-      "start_node_id": "STVB 03",
-      "end_node_id": "STVB 04",
-      "length_mm": 290.0,
-      "max_diameter_mm": 0.0,
-      "bend_radius_mm": 0.0,
-      "length_locked": false,
-      "metadata": {
-        "auto_generated": true,
-        "direct": true
-      }
-    },
-    {
-      "edge_id": "SEG_AUTO_3",
-      "start_node_id": "STVB 05",
-      "end_node_id": "BRANCH_4",
-      "length_mm": 233.50187114325314,
-      "max_diameter_mm": 0.0,
-      "bend_radius_mm": 0.0,
-      "length_locked": false,
-      "metadata": {
-        "auto_generated": true,
-        "direct": true
-      }
-    },
-    {
-      "edge_id": "SEG_SPLIT_1",
-      "start_node_id": "BRANCH_1",
-      "end_node_id": "SPLICE_1",
-      "length_mm": 79.69364738680761,
-      "max_diameter_mm": 0.0,
-      "bend_radius_mm": 0.0,
-      "length_locked": false,
-      "metadata": {}
-    },
-    {
-      "edge_id": "SEG_SPLIT_2",
-      "start_node_id": "BRANCH_2",
-      "end_node_id": "SPLICE_1",
-      "length_mm": 69.0547693236526,
-      "max_diameter_mm": 8.5,
-      "bend_radius_mm": 25.0,
-      "length_locked": true,
-      "metadata": {}
-    },
-    {
-      "edge_id": "SEG_SPLIT_3",
-      "start_node_id": "BRANCH_4",
-      "end_node_id": "STVBF 01",
-      "length_mm": 176.91932448077597,
-      "max_diameter_mm": 6.0,
-      "bend_radius_mm": 18.0,
-      "length_locked": false,
-      "metadata": {}
-    },
-    {
-      "edge_id": "SEG_SPLIT_4",
-      "start_node_id": "BRANCH_4",
-      "end_node_id": "SPLICE_1",
-      "length_mm": 56.49812885674686,
-      "max_diameter_mm": 0.0,
-      "bend_radius_mm": 0.0,
-      "length_locked": false,
-      "metadata": {}
-    }
+    
   ],
   "wires": [
     {
@@ -230,8 +86,6 @@
       "to_node_id": "SPLICE_1",
       "to_pin": "1",
       "route_edge_ids": [
-        "SEG_2",
-        "SEG_SPLIT_3"
       ],
       "metadata": {}
     },
@@ -244,10 +98,6 @@
       "to_node_id": "STVB 01",
       "to_pin": "5",
       "route_edge_ids": [
-        "SEG_2",
-        "SEG_SPLIT_3",
-        "SEG_1",
-        "SEG_SPLIT_2"
       ],
       "metadata": {}
     },
@@ -260,8 +110,6 @@
       "to_node_id": "SPLICE_1",
       "to_pin": "2",
       "route_edge_ids": [
-        "SEG_2",
-        "SEG_SPLIT_3"
       ],
       "metadata": {}
     },
@@ -274,10 +122,6 @@
       "to_node_id": "STVB 01",
       "to_pin": "7",
       "route_edge_ids": [
-        "SEG_2",
-        "SEG_SPLIT_3",
-        "SEG_1",
-        "SEG_SPLIT_2"
       ],
       "metadata": {}
     },
@@ -290,10 +134,6 @@
       "to_node_id": "STVB 01",
       "to_pin": "1",
       "route_edge_ids": [
-        "SEG_2",
-        "SEG_SPLIT_3",
-        "SEG_1",
-        "SEG_SPLIT_2"
       ],
       "metadata": {}
     },
@@ -306,10 +146,6 @@
       "to_node_id": "STVB 01",
       "to_pin": "2",
       "route_edge_ids": [
-        "SEG_2",
-        "SEG_SPLIT_3",
-        "SEG_1",
-        "SEG_SPLIT_2"
       ],
       "metadata": {}
     },
@@ -322,8 +158,6 @@
       "to_node_id": "SPLICE_1",
       "to_pin": "2",
       "route_edge_ids": [
-        "SEG_AUTO_1",
-        "SEG_SPLIT_1"
       ],
       "metadata": {}
     },
@@ -336,7 +170,6 @@
       "to_node_id": "STVB 04",
       "to_pin": "1",
       "route_edge_ids": [
-        "SEG_AUTO_2"
       ],
       "metadata": {}
     },
@@ -349,8 +182,6 @@
       "to_node_id": "SPLICE_1",
       "to_pin": "1",
       "route_edge_ids": [
-        "SEG_AUTO_3",
-        "SEG_SPLIT_4"
       ],
       "metadata": {}
     }

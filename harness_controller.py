@@ -114,76 +114,146 @@ class AddNodeCommand(QUndoCommand):
 
 
 class MergeBranchPointsCommand(QUndoCommand):
-    """Undoable structural merge of one BRANCH_POINT onto another.
-    Reassigns external edges to the target, swallows connecting edges,
-    and hides the moved node while retaining its data for unmerging."""
+    """Undoable merge of one BRANCH_POINT onto another.
+
+    Does NOT delete either node — both stay in the model. But to behave
+    correctly with everything else (dragging, length-lock, the fix-length
+    arrows' bridge/cycle analysis), there can only be ONE node that's
+    actually live in the graph after a merge: every edge that was
+    attached to the moved node gets rewired onto the target instead, so
+    the target becomes the single shared connection point. The moved node
+    keeps its own Node entry (position, metadata, id) but ends up with
+    zero edges of its own — a dormant, exactly-coincident duplicate that
+    from then on mirrors the target's position on every move.
+
+    reassigned_edges is the list of (edge_id, end) pairs moved from the
+    moved node onto the target — recorded so undo can move them back
+    exactly, and so a future dedicated "unmerge" action can reuse the
+    same reversal without needing undo history."""
 
     def __init__(self, controller: "HarnessController", moved_node_id: str, target_node_id: str,
-                 pre_merge_pos: tuple, target_pos: tuple, old_metadata: dict,reassigned_edges: list):
+                 pre_merge_pos: tuple, target_pos: tuple, old_metadata: dict,
+                 reassigned_edges: list):
         super().__init__(f"Merge {moved_node_id} into {target_node_id}")
         self.controller = controller
         self.moved_node_id = moved_node_id
         self.target_node_id = target_node_id
         self.pre_merge_pos = pre_merge_pos
         self.target_pos = target_pos
-        self.old_metadata = old_metadata
+        self.old_metadata = old_metadata  # snapshot of moved node's metadata BEFORE this merge
+        self.reassigned_edges = reassigned_edges  # [(edge_id, "start"|"end"), ...]
+        self.edge_updates = []  # Tracks precise modifications for undo/redo tracking
 
-        self.edges_to_reassign = []  # [(edge_id, field_name_to_change)]
-        self.edges_to_swallow = []   # [Edge objects]
-        self.wires_to_update = []    # [(wire_id, old_route, new_route)]
+        # 1. Gather all edges connected to the moving branch point
+        moved_edges = [e for e in controller.harness.edges.values() 
+                       if e.start_node_id == moved_node_id or e.end_node_id == moved_node_id]
+        
+        # 2. Gather all edges connected to the stationary target branch point
+        target_edges = [e for e in controller.harness.edges.values() 
+                        if e.start_node_id == target_node_id or e.end_node_id == target_node_id]
 
-        # Analyze topology to determine what happens to the edges
-        for edge in list(controller.harness.edges.values()):
-            if self.moved_node_id in (edge.start_node_id, edge.end_node_id):
-                other_node = edge.end_node_id if edge.start_node_id == self.moved_node_id else edge.start_node_id
+        for m_edge in moved_edges:
+            # Determine the far node id that this moving edge reaches out to
+            m_far_node = m_edge.end_node_id if m_edge.start_node_id == moved_node_id else m_edge.start_node_id
+            
+            # Look for a parallel counterpart on the stationary branch reaching out to the same node
+            stationary_counterpart = None
+            for t_edge in target_edges:
+                t_far_node = t_edge.end_node_id if t_edge.start_node_id == target_node_id else t_edge.start_node_id
+                if t_far_node == m_far_node:
+                    stationary_counterpart = t_edge
+                    break
+
+            if stationary_counterpart:
+                # Parallel Overlap Case:
+                # m_edge is the moving edge. stationary_counterpart did NOT move.
+                self.edge_updates.append({
+                    "edge_id": m_edge.edge_id,
+                    "type": "moved_parallel",
+                    "field_to_change": "start_node_id" if m_edge.start_node_id == moved_node_id else "end_node_id",
+                    "old_node_id": moved_node_id,
+                    "new_node_id": target_node_id,
+                    
+                    # Track length preservation
+                    "old_length": m_edge.length_mm,
+                    "new_length": stationary_counterpart.length_mm, # Inherit from the unmoved branch
+                    
+                    # Track structural constraints
+                    "old_locked": m_edge.length_locked,
+                    "new_locked": True,
+                    
+                    # Inject label hiding flag into metadata copy
+                    "old_metadata": dict(m_edge.metadata),
+                    "new_metadata": {**m_edge.metadata, "hide_label": True}
+                })
                 
-                if other_node == self.target_node_id:
-                    # Edge connects the two merging nodes directly; swallow it
-                    self.edges_to_swallow.append(edge)
-                else:
-                    # Edge goes somewhere else; re-anchor it to the target
-                    field = "start_node_id" if edge.start_node_id == self.moved_node_id else "end_node_id"
-                    self.edges_to_reassign.append((edge.edge_id, field))
-
-        # Analyze wires passing through swallowed edges
-        swallow_ids = {e.edge_id for e in self.edges_to_swallow}
-        if swallow_ids:
-            for wire in controller.harness.wires.values():
-                if any(eid in swallow_ids for eid in wire.route_edge_ids):
-                    new_route = [eid for eid in wire.route_edge_ids if eid not in swallow_ids]
-                    self.wires_to_update.append((wire.wire_id, list(wire.route_edge_ids), new_route))
+                # Ensure the stationary edge is also locked
+                self.edge_updates.append({
+                    "edge_id": stationary_counterpart.edge_id,
+                    "type": "stationary_parallel",
+                    "old_locked": stationary_counterpart.length_locked,
+                    "new_locked": True
+                })
+            else:
+                # Standard Re-anchor Case (no parallel collision on this segment)
+                self.edge_updates.append({
+                    "edge_id": m_edge.edge_id,
+                    "type": "standard_reanchor",
+                    "field_to_change": "start_node_id" if m_edge.start_node_id == moved_node_id else "end_node_id",
+                    "old_node_id": moved_node_id,
+                    "new_node_id": target_node_id
+                })
 
     def redo(self) -> None:
-        # 1. Update wire routes to bypass the edges we are about to swallow
-        for wire_id, _, new_route in self.wires_to_update:
-            self.controller._apply_field("wire", wire_id, "route_edge_ids", new_route)
-
-        # 2. Remove swallowed edges from the active graph
-        for edge in self.edges_to_swallow:
-            self.controller._apply_remove_edge(edge.edge_id)
-
-        # 3. Re-anchor remaining edges to the target node
-        for edge_id, field in self.edges_to_reassign:
-            self.controller._apply_field("edge", edge_id, field, self.target_node_id)
-
-        # 4. Update the merged node metadata (This makes it invisible via the view refresh)
-        self.controller._apply_merge(self.moved_node_id, self.target_node_id, self.target_pos, self.pre_merge_pos)
+        # Apply structured properties across all impacted bundle lines
+        for update in self.edge_updates:
+            eid = update["edge_id"]
+            if update["type"] == "moved_parallel":
+                self.controller._apply_field("edge", eid, update["field_to_change"], update["new_node_id"])
+                self.controller._apply_field("edge", eid, "length_mm", update["new_length"])
+                self.controller._apply_field("edge", eid, "length_locked", update["new_locked"])
+                self.controller._apply_field("edge", eid, "metadata", update["new_metadata"])
+            elif update["type"] == "stationary_parallel":
+                self.controller._apply_field("edge", eid, "length_locked", update["new_locked"])
+            elif update["type"] == "standard_reanchor":
+                self.controller._apply_field("edge", eid, update["field_to_change"], update["new_node_id"])
+        target_node = self.controller.harness.nodes[self.target_node_id]
+        current_merged = list(target_node.metadata.get("merged_nodes", []))
+        if self.moved_node_id not in current_merged:
+            current_merged.append(self.moved_node_id)
+        
+        # Apply updated list to target node metadata
+        new_target_metadata = {**target_node.metadata, "merged_nodes": current_merged}
+        self.controller._apply_field("node", self.target_node_id, "metadata", new_target_metadata)
+        
+        # Hide/Ghost out the moved branch point node
+        self.controller._apply_merge(self.moved_node_id, self.target_node_id, self.target_pos, self.pre_merge_pos,self.reassigned_edges)
 
     def undo(self) -> None:
-        # 1. Un-ghost the node by restoring old metadata
-        self.controller._apply_unmerge(self.moved_node_id, self.pre_merge_pos, self.old_metadata)
-
-        # 2. Re-anchor edges back to the original node
-        for edge_id, field in self.edges_to_reassign:
-            self.controller._apply_field("edge", edge_id, field, self.moved_node_id)
-
-        # 3. Restore swallowed edges back to the graph
-        for edge in self.edges_to_swallow:
-            self.controller._apply_add_edge(edge)
-
-        # 4. Restore original wire routes
-        for wire_id, old_route, _ in self.wires_to_update:
-            self.controller._apply_field("wire", wire_id, "route_edge_ids", old_route)
+        # 1. Un-ghost and restore the original node model parameters first
+        self.controller._apply_unmerge(self.moved_node_id, self.pre_merge_pos, self.old_metadata,self.reassigned_edges)
+        
+        # Remove the node from the target node's tracking list
+        target_node = self.controller.harness.nodes[self.target_node_id]
+        current_merged = list(target_node.metadata.get("merged_nodes", []))
+        if self.moved_node_id in current_merged:
+            current_merged.remove(self.moved_node_id)
+            
+        new_target_metadata = {**target_node.metadata, "merged_nodes": current_merged}
+        self.controller._apply_field("node", self.target_node_id, "metadata", new_target_metadata)
+        
+        # 2. Iterate backward to seamlessly restore the original edge attributes
+        for update in reversed(self.edge_updates):
+            eid = update["edge_id"]
+            if update["type"] == "moved_parallel":
+                self.controller._apply_field("edge", eid, update["field_to_change"], update["old_node_id"])
+                self.controller._apply_field("edge", eid, "length_mm", update["old_length"])
+                self.controller._apply_field("edge", eid, "length_locked", update["old_locked"])
+                self.controller._apply_field("edge", eid, "metadata", update["old_metadata"])
+            elif update["type"] == "stationary_parallel":
+                self.controller._apply_field("edge", eid, "length_locked", update["old_locked"])
+            elif update["type"] == "standard_reanchor":
+                self.controller._apply_field("edge", eid, update["field_to_change"], update["old_node_id"])
 
 
 class AddWireCommand(QUndoCommand):
@@ -199,8 +269,188 @@ class AddWireCommand(QUndoCommand):
 
     def undo(self) -> None:
         self.controller._apply_remove_wire(self.wire.wire_id)
+class UnmergeSingleBranchPointCommand(QUndoCommand):
+    """Command to unmerge a specific branch point back to its pre-merge state."""
+    
+    def __init__(self, controller: "HarnessController", target_node_id: str, unmerge_node_id: str):
+        super().__init__(f"Unmerge {unmerge_node_id} from {target_node_id}")
+        self.controller = controller
+        self.target_node_id = target_node_id
+        self.unmerge_node_id = unmerge_node_id
+        
+        # Look up the original position/metadata stored when the node was merged
+        unmerge_node = controller.harness.nodes[unmerge_node_id]
+        self.original_pos = (unmerge_node.position) # or from tracking metadata
+        self.old_metadata = dict(unmerge_node.metadata)
+        
+        # Gather all edges that originally belonged to this specific node
+        self.edge_restorations = []
+        for edge in controller.harness.edges.values():
+            # Check if this edge was flagged as parallel or hidden during the merge phase
+            if edge.metadata.get("hide_label") is True and (
+                edge.start_node_id == target_node_id or edge.end_node_id == target_node_id
+            ):
+                # If this edge originally belonged to the unmerging node, restore it
+                # (You can track original endpoints in edge.metadata['original_start_node_id'] if needed)
+                if edge.metadata.get("original_node_id") == unmerge_node_id:
+                    self.edge_restorations.append({
+                        "edge_id": edge.edge_id,
+                        "field_to_restore": "start_node_id" if edge.start_node_id == target_node_id else "end_node_id",
+                        "old_length": edge.metadata.get("pre_merge_length", edge.length_mm),
+                        "old_locked": edge.metadata.get("pre_merge_locked", False),
+                        "old_metadata": {k: v for k, v in edge.metadata.items() if k not in ["hide_label", "original_node_id"]}
+                    })
 
+    def redo(self) -> None:
+        # 1. Bring the node back to life structurally
+        self.controller._apply_unmerge(self.unmerge_node_id, self.original_pos, self.old_metadata,[])
+        
+        # 2. Re-anchor its respective bundle edges back to it and show labels
+        for rest in self.edge_restorations:
+            eid = rest["edge_id"]
+            self.controller._apply_field("edge", eid, rest["field_to_restore"], self.unmerge_node_id)
+            self.controller._apply_field("edge", eid, "length_mm", rest["old_length"])
+            self.controller._apply_field("edge", eid, "length_locked", rest["old_locked"])
+            self.controller._apply_field("edge", eid, "metadata", rest["old_metadata"])
+            
+        # 3. Pull out from the target's tracking metadata list
+        target_node = self.controller.harness.nodes[self.target_node_id]
+        merged_list = list(target_node.metadata.get("merged_nodes", []))
+        if self.unmerge_node_id in merged_list:
+            merged_list.remove(self.unmerge_node_id)
+        self.controller._apply_field("node", self.target_node_id, "metadata", {**target_node.metadata, "merged_nodes": merged_list})
+        
+        self.controller.view.render() # Trigger canvas redraw
 
+    def undo(self) -> None:
+        # Re-merge back down to target
+        # (This basically does the reverse of redo, returning state to combined form)
+        target_node = self.controller.harness.nodes[self.target_node_id]
+        merged_list = list(target_node.metadata.get("merged_nodes", []))
+        if self.unmerge_node_id not in merged_list:
+            merged_list.append(self.unmerge_node_id)
+        self.controller._apply_field("node", self.target_node_id, "metadata", {**target_node.metadata, "merged_nodes": merged_list})
+
+        for rest in self.edge_restorations:
+            eid = rest["edge_id"]
+            self.controller._apply_field("edge", eid, rest["field_to_restore"], self.target_node_id)
+            # Re-hide length attributes
+            self.controller._apply_field("edge", eid, "metadata", {**rest["old_metadata"], "hide_label": True, "original_node_id": self.unmerge_node_id})
+
+        self.controller._apply_merge(self.unmerge_node_id, self.target_node_id, (target_node.position[0], target_node.position[1]), self.original_pos,[])
+        self.controller.view.render()
+        
+from PyQt5.QtWidgets import QUndoCommand
+from harness_routing import find_route
+
+class DeleteNodeCommand(QUndoCommand):
+    """Deletes a node. If it is an intermediate branch point connecting exactly 
+    two segments, it collapses them into a single continuous edge instead of 
+    deleting both sides, then automatically re-routes any affected wires."""
+    
+    def __init__(self, controller: "HarnessController", node_id: str):
+        super().__init__(f"Delete Branch Point {node_id}")
+        self.controller = controller
+        self.node_id = node_id
+        
+        harness = controller.harness
+        self.old_node = harness.nodes[node_id]
+        
+        # 1. Identify all physical segments attached to this node
+        self.connected_edges = [
+            e for e in harness.edges.values()
+            if e.start_node_id == node_id or e.end_node_id == node_id
+        ]
+        
+        # 2. Identify all wires whose current path utilizes any of these segments
+        connected_edge_ids = {e.edge_id for e in self.connected_edges}
+        self.affected_wires = [
+            w for w in harness.wires.values()
+            if any(eid in connected_edge_ids for eid in getattr(w, "route_edge_ids", []))
+        ]
+        
+        # 3. Snapshot pristine states for an exact undo checkpoint
+        self.old_wire_routes = {w.wire_id: list(w.route_edge_ids) for w in self.affected_wires}
+        self.old_edges_snapshot = {eid: dict(e.__dict__) for eid, e in harness.edges.items()}
+        self.old_edges_objects = dict(harness.edges)
+        
+        # 4. Determine structural topology optimization strategy
+        self.strategy = "delete_all_edges"
+        self.edge_to_modify = None
+        self.edge_to_delete = None
+        self.new_endpoints = None
+        self.new_length = 0.0
+        
+        if len(self.connected_edges) == 2:
+            # Branch line collapse optimization: bridge the outer endpoints directly
+            self.strategy = "collapse"
+            self.edge_to_modify = self.connected_edges[0]
+            self.edge_to_delete = self.connected_edges[1]
+            
+            e1 = self.edge_to_modify
+            e2 = self.edge_to_delete
+            
+            # Find the remaining outer boundary node IDs
+            outer_node_1 = e1.end_node_id if e1.start_node_id == node_id else e1.start_node_id
+            outer_node_2 = e2.end_node_id if e2.start_node_id == node_id else e2.start_node_id
+            
+            self.new_endpoints = (outer_node_1, outer_node_2)
+            # Combine individual lengths to keep total electrical path run intact
+            self.new_length = e1.length_mm + e2.length_mm
+
+    def redo(self) -> None:
+        harness = self.controller.harness
+        
+        if self.strategy == "collapse":
+            # Modify the preserved edge side to span across the entire gap
+            e_mod = self.edge_to_modify
+            n1, n2 = self.new_endpoints
+            
+            e_mod.start_node_id = n1
+            e_mod.end_node_id = n2
+            e_mod.length_mm = self.new_length
+            
+            # Safely drop the redundant opposing side edge segment
+            if self.edge_to_delete.edge_id in harness.edges:
+                del harness.edges[self.edge_to_delete.edge_id]
+        else:
+            # Fallback for dead-ends or complex multi-way intersections
+            for edge in self.connected_edges:
+                if edge.edge_id in harness.edges:
+                    del harness.edges[edge.edge_id]
+                    
+        # Remove the structural node object from the graph map
+        if self.node_id in harness.nodes:
+            del harness.nodes[self.node_id]
+            
+        # 5. Dynamically run the router on affected wires to repair topological paths
+        for wire in self.affected_wires:
+            self.controller.auto_route_wire(wire.wire_id)
+            
+        self.controller.view.render()
+
+    def undo(self) -> None:
+        try:
+            harness = self.controller.harness
+            
+            # Restore node map reference
+            harness.nodes[self.node_id] = self.old_node
+            
+            # Restore all edge reference entries and their raw property fields
+            harness.edges.clear()
+            for eid, edge_obj in self.old_edges_objects.items():
+                harness.edges[eid] = edge_obj
+                for attr, val in self.old_edges_snapshot[eid].items():
+                    setattr(edge_obj, attr, val)
+                    
+            # Revert historical wire routing lists
+            for wire_id, original_route in self.old_wire_routes.items():
+                if wire_id in harness.wires:
+                    harness.wires[wire_id].route_edge_ids = list(original_route)
+                    
+            self.controller.view.render()
+        except Exception as e:
+            print("error:",str(e))
 class SetFieldCommand(QUndoCommand):
     """Generic undoable set of a single attribute on a model entity
     (Node.label, Edge.length_mm, Wire.color, etc). Covers renaming and
@@ -263,7 +513,7 @@ class HarnessController(QObject):
         self._applying = False
 
         self.modelChanged.connect(self._on_model_changed)
-
+        self.undo_stack.indexChanged.connect(self.undo_changed)
         # Reconnect to the scene's items whenever the view rebuilds them
         # (e.g. on File > Open), and connect now in case items already
         # exist.
@@ -271,7 +521,8 @@ class HarnessController(QObject):
         self.connect_scene()
 
     # ---- wiring into the scene ----
-
+    def undo_changed(self):
+        print("undo changed , ind ",self.undo_stack.index())
     def connect_scene(self) -> None:
         """(Re)connect to every node/edge item currently in the view, and
         re-sync self.harness. Safe to call repeatedly — old items are gone
@@ -327,13 +578,26 @@ class HarnessController(QObject):
             target_id = self._find_merge_target(node_id, new_pos_tuple)
             if target_id is not None:
                 target_pos = self.harness.nodes[target_id].position
+                reassigned_edges = self._find_connected_edges(node_id)
                 self.undo_stack.push(MergeBranchPointsCommand(
-                    self, node_id, target_id, old_pos_tuple, tuple(target_pos), dict(node.metadata)
+                    self, node_id, target_id, old_pos_tuple, tuple(target_pos), 
+                    dict(node.metadata),reassigned_edges
                 ))
                 return
 
         self.undo_stack.push(MoveNodeCommand(self, node_id, old_pos_tuple, new_pos_tuple))
-
+    def _find_connected_edges(self, node_id: str) -> list:
+        """Every edge currently attached to node_id, as (edge_id, end)
+        pairs where end is "start" or "end" — i.e. which of the edge's
+        two endpoint fields points at this node. Used to rewire a merged
+        node's edges onto its target (and back again on unmerge)."""
+        result = []
+        for edge_id, edge in self.harness.edges.items():
+            if edge.start_node_id == node_id:
+                result.append((edge_id, "start"))
+            if edge.end_node_id == node_id:
+                result.append((edge_id, "end"))
+        return result
     def _find_merge_target(self, moving_node_id: str, position: tuple) -> Optional[str]:
         """Closest OTHER branch point within BRANCH_MERGE_DISTANCE_MM, if
         any (mirrors NodeGraphicsItem._nearby_branch_point's live preview,
@@ -547,6 +811,8 @@ class HarnessController(QObject):
         per-row 'Auto-Route' button in the Wires tab). Same direct-edge
         fallback as add_wire_auto_route."""
         wire = self.harness.wires[wire_id]
+        if not wire:
+            return
         old_route = list(wire.route_edge_ids)
         route, new_edge = self._compute_route_or_direct_edge(wire.from_node_id, wire.to_node_id)
 
@@ -667,21 +933,67 @@ class HarnessController(QObject):
         del self.harness.edges[edge_id]
         self.edgeListChanged.emit()
 
-    def _apply_merge(self, moved_node_id: str, target_node_id: str, target_pos: tuple, pre_merge_pos: tuple) -> None:
+    def _apply_merge(self, moved_node_id: str, target_node_id: str, target_pos: tuple,
+                      pre_merge_pos: tuple, reassigned_edges: list) -> None:
         node = self.harness.nodes[moved_node_id]
         node.metadata["merged_into"] = target_node_id
         node.metadata["pre_merge_position"] = list(pre_merge_pos)
-        # Position update goes through the normal path so the graphics
-        # item, undo-guard, and modelChanged signal all behave exactly
-        # like any other move.
-        self._apply_node_position(moved_node_id, target_pos)
-        self.view.refresh_entity("node", moved_node_id)  # picks up the merged-into tooltip text
+        node.metadata["merged_edges"] = [[edge_id, end] for edge_id, end in reassigned_edges]
 
-    def _apply_unmerge(self, moved_node_id: str, pre_merge_pos: tuple, old_metadata: dict) -> None:
+        # The target becomes the ONE live connection point: every edge
+        # that was on the moved node moves onto the target instead. This
+        # is what makes dragging, length-lock, and the fix-length arrows'
+        # bridge/cycle analysis all treat the merged pair as a single
+        # point — the moved node ends up with zero edges of its own.
+        for edge_id, end in reassigned_edges:
+            edge = self.harness.edges[edge_id]
+            if end == "start":
+                edge.start_node_id = target_node_id
+            else:
+                edge.end_node_id = target_node_id
+            self.view.reassign_edge_endpoint(edge_id, end, target_node_id)
+
+        self._apply_node_position(moved_node_id, target_pos)
+
+        target_item = self.view.node_items.get(target_node_id)
+        moved_item = self.view.node_items.get(moved_node_id)
+        if target_item is not None and moved_item is not None:
+            # From now on the moved node mirrors the target's position on
+            # every move (drag, undo/redo, fix-length translation, ...),
+            # since it no longer has any edges of its own to keep it
+            # honest otherwise.
+            target_item.register_follower(moved_item)
+
+        self.view.refresh_entity("node", moved_node_id)
+        for edge_id, _ in reassigned_edges:
+            self.view.refresh_entity("edge", edge_id)
+        self.edgeListChanged.emit()
+    def _apply_unmerge(self, moved_node_id: str, pre_merge_pos: tuple,
+                        old_metadata: dict, reassigned_edges: list) -> None:
+        target_node_id = self.harness.nodes[moved_node_id].metadata.get("merged_into")
+
+        target_item = self.view.node_items.get(target_node_id) if target_node_id else None
+        moved_item = self.view.node_items.get(moved_node_id)
+        if target_item is not None and moved_item is not None:
+            target_item.unregister_follower(moved_item)
+
+        # Move the previously-shared edges back onto the un-merged node.
+        for edge_id, end in reassigned_edges:
+            edge = self.harness.edges[edge_id]
+            if end == "start":
+                edge.start_node_id = moved_node_id
+            else:
+                edge.end_node_id = moved_node_id
+            self.view.reassign_edge_endpoint(edge_id, end, moved_node_id)
+
         node = self.harness.nodes[moved_node_id]
         node.metadata = dict(old_metadata)
         self._apply_node_position(moved_node_id, pre_merge_pos)
+
         self.view.refresh_entity("node", moved_node_id)
+        for edge_id, _ in reassigned_edges:
+            self.view.refresh_entity("edge", edge_id)
+        self.edgeListChanged.emit()
 
     def _apply_add_node(self, node: Node) -> None:
         self.harness.add_node(node)
@@ -709,3 +1021,13 @@ class HarnessController(QObject):
 
     def _on_model_changed(self, entity_kind: str, entity_id: str) -> None:
         self.view.refresh_entity(entity_kind, entity_id)
+        
+    def unmerge_branch_point(self, target_node_id: str, unmerge_node_id: str) -> None:
+        """Pushes an unmerge command onto the undo history stack."""
+        cmd = UnmergeSingleBranchPointCommand(self, target_node_id, unmerge_node_id)
+        self.undo_stack.push(cmd)
+
+    def delete_node(self, node_id: str) -> None:
+        """Pushes a delete command onto the undo history stack."""
+        cmd = DeleteNodeCommand(self, node_id)
+        self.undo_stack.push(cmd)

@@ -49,6 +49,7 @@ class MainWindow(QMainWindow):
         # Add the Edges tab
         from wires_panel import EdgesTab
         self.edges_tab = EdgesTab(self.controller, self.view, self)
+        self.edges_tab.table.itemSelectionChanged.connect(self._on_edges_tab_selection_changed)
         self.side_panel.addTab(self.edges_tab, "Edges")
 
         splitter = QSplitter(Qt.Horizontal, self)
@@ -157,7 +158,21 @@ class MainWindow(QMainWindow):
             return
         self.status_bar.showMessage(f"Saved '{path}'")
         self.setWindowTitle(f"Harness Editor — {path}")
-
+    def _on_edges_tab_selection_changed(self) -> None:
+        """Triggered automatically whenever a user shifts their focus row in the sidebar list."""
+        # For a QTableWidget:
+        selected_ranges = self.edges_tab.table.selectedRanges()
+        if not selected_ranges:
+            return
+        
+        target_row = selected_ranges[0].topRow()
+        
+        # Get the Edge ID cell. Assuming Edge ID is written into Column 0
+        id_item = self.edges_tab.table.item(target_row, 0)
+        if id_item:
+            edge_id = id_item.text()
+            # Dispatch selection focus request down to the smart graphics engine view
+            self.view.select_edge_by_id(edge_id)
 
 def main():
     app = QApplication(sys.argv)

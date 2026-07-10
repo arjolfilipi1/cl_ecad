@@ -142,15 +142,16 @@ class NodeGraphicsItem(QGraphicsObject):
     # NOT emitted on every intermediate mouse-move step, so one drag
     # produces exactly one undo command.
     moveFinished = pyqtSignal(str, QPointF, QPointF)
-
+    splitRequested = pyqtSignal(str,str)
     def __init__(self, node: Node, radius: Optional[float] = None, parent: Optional[QGraphicsItem] = None):
         super().__init__(parent)
         self.node = node
         self.radius = radius if radius is not None else NODE_RADII.get(node.node_type, NODE_RADIUS)
         self.edges: list["EdgeGraphicsItem"] = []  # edges attached to this node
+        self.merged_followers: list["NodeGraphicsItem"] = []
         self._press_pos: Optional[QPointF] = None  # position at the start of the current drag
         self._merge_preview = False  # true while dragging a BRANCH_POINT within merge range of another
-
+        
         self._polygon: Optional[QPolygonF] = None  # None => draw as ellipse
         if node.node_type == NodeType.SPLICE:
             self._polygon = _regular_polygon(self.radius, sides=6)
@@ -172,9 +173,42 @@ class NodeGraphicsItem(QGraphicsObject):
         self.label_item.setDefaultTextColor(LABEL_COLOR)
         label_rect = self.label_item.boundingRect()
         self.label_item.setPos(-label_rect.width() / 2, self.radius + 2)
+    def contextMenuEvent(self, event) -> None:
+        """Right-click context menu for unmerging sub-branches and deletion."""
+        # Only show context menu for branch/splice nodes if desired, or all nodes
+        harness_view = self.scene().views()[0]
+        controller = harness_view.parent.controller  # Assumes view has a reference to the controller
+
+        menu = QMenu()
+        
+        # --- Section 1: Unmerge Dynamic Options ---
+        # Look into metadata to see which node IDs were swallowed/merged into this one
+        merged_nodes = self.node.metadata.get("merged_nodes", [])
+        
+        if merged_nodes:
+            for original_node_id in merged_nodes:
+                unmerge_action = menu.addAction(f"Unmerge {original_node_id}")
+                # Use a lambda capturing the current loop variable default value
+                unmerge_action.triggered.connect(
+                    lambda checked=False, node_id=original_node_id: 
+                    controller.unmerge_branch_point(self.node.node_id, node_id)
+                )
+            menu.addSeparator()
+
+        # --- Section 2: Delete Option ---
+        delete_action = menu.addAction("Delete Branch Point")
+        delete_action.triggered.connect(lambda: controller.delete_node(self.node.node_id))
+
+        # Exec the menu at the cursor position
+        chosen = menu.exec_(event.screenPos())
 
     # ---- bookkeeping used by EdgeGraphicsItem ----
-
+    def register_follower(self, follower_item: "NodeGraphicsItem") -> None:
+        if follower_item not in self.merged_followers:
+            self.merged_followers.append(follower_item)
+    def unregister_follower(self, follower_item: "NodeGraphicsItem") -> None:
+        if follower_item in self.merged_followers:
+            self.merged_followers.remove(follower_item)
     def register_edge(self, edge_item: "EdgeGraphicsItem") -> None:
         self.edges.append(edge_item)
 
@@ -279,6 +313,8 @@ class NodeGraphicsItem(QGraphicsObject):
         if change == QGraphicsItem.ItemPositionHasChanged:
             for edge_item in self.edges:
                 edge_item.update_line()
+            for follower_item in self.merged_followers:
+                follower_item.setPos(self.pos())
             if self._press_pos is not None:
                 # Live "would this merge on release?" preview, only during
                 # an actual interactive drag.
@@ -436,7 +472,7 @@ class EdgeGraphicsItem(QGraphicsObject):
 
         start_item.register_edge(self)
         end_item.register_edge(self)
-
+    
         # This item is never repositioned via setPos() (it stays at local
         # origin (0,0) forever), so children placed with setPos(x, y) sit
         # at that exact scene coordinate — no extra transform math needed
@@ -456,8 +492,12 @@ class EdgeGraphicsItem(QGraphicsObject):
             self.update()
 
     def set_arrows_visible(self, visible: bool) -> None:
-        self.start_arrow.setVisible(visible)
-        self.end_arrow.setVisible(visible)
+        if self.edge.metadata.get("hide_label") is True:
+            self.start_arrow.setVisible(False)
+            self.end_arrow.setVisible(False)
+        else:
+            self.start_arrow.setVisible(visible)
+            self.end_arrow.setVisible(visible)
 
     def update_line(self) -> None:
         """Recompute the line from the live positions of the endpoint nodes."""
@@ -503,9 +543,15 @@ class EdgeGraphicsItem(QGraphicsObject):
         the controller has changed a field on self.edge (length_mm,
         length_locked, ...). Line geometry itself is driven by the
         endpoint nodes' positions via update_line(), not this."""
-        self.setToolTip(self._tooltip())
-        self._update_length_label()
-        self.update()
+        is_merged = self.edge.metadata.get("merged_type") is not None
+
+        # Hide the entire edge graphics item (line, labels, and arrows) if merged
+        self.setVisible(not is_merged)
+
+        if not is_merged:
+            self.setToolTip(self._tooltip())
+            self._update_length_label()
+            self.update()
 
     def _update_length_label(self) -> None:
         """Position the length label aligned with the edge and a little
@@ -515,6 +561,16 @@ class EdgeGraphicsItem(QGraphicsObject):
         why: a length_locked edge that somehow drifted out of sync, an
         ordinary unlocked edge whose nodes moved without its length_mm
         being updated, etc. A lock icon prefix marks locked edges."""
+        if self.edge.metadata.get("hide_label") is True:
+            self.length_label.setVisible(False)
+            self.start_arrow.setVisible(False)
+            self.end_arrow.setVisible(False)
+            return  # Stop execution early so this label stays hidden
+        else:
+            self.length_label.setVisible(True)
+            self.set_arrows_visible(self.length_label.isSelected())
+
+        # --- Your existing layout and text calculation code continues below ---
         dx = self._line_end.x() - self._line_start.x()
         dy = self._line_end.y() - self._line_start.y()
         actual_distance = math.hypot(dx, dy)
@@ -617,7 +673,7 @@ class HarnessGraphicsView(QGraphicsView):
         self.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
         # Load initial grid state from settings
         self.load_settings()
-
+        self.parent = parent
         # Built-in Floating HUD Zoom Indicator
         self.zoom_label = QLabel(self)
         self.zoom_label.setStyleSheet("""
@@ -737,7 +793,10 @@ class HarnessGraphicsView(QGraphicsView):
             edge_item = EdgeGraphicsItem(edge, start_item, end_item)
             self.scene.addItem(edge_item)
             self.edge_items[edge.edge_id] = edge_item
-
+        for node in self.harness.nodes.values():
+            target_id = node.metadata.get("merged_into")
+            if target_id and target_id in self.node_items and node.node_id in self.node_items:
+                self.node_items[target_id].register_follower(self.node_items[node.node_id])
         self.scene.setSceneRect(self.scene.itemsBoundingRect().adjusted(-40, -40, 40, 40))
         self.fitInView(self.scene.sceneRect(), Qt.KeepAspectRatio)
 
@@ -937,6 +996,21 @@ class HarnessGraphicsView(QGraphicsView):
             edge_item.end_item = new_node_item
             new_node_item.register_edge(edge_item)
         edge_item.update_line()
+    def select_edge_by_id(self, edge_id: str) -> None:
+        """Finds an edge graphic item, clears active selections, marks it selected, 
+        and softly brings it into view focus."""
+        # Temporarily block signals to prevent recursive feedback loops if bidirectional syncing is on
+        self.scene.blockSignals(True)
+        self.scene.clearSelection()
+        
+        edge_item = self.edge_items.get(edge_id)
+        if edge_item:
+            edge_item.setSelected(True)
+            # Smoothly center the canvas viewpoint around the selected layout line segment
+            self.centerOn(edge_item)
+            
+        self.scene.blockSignals(False)
+        self.viewport().update()
     def _expand_scene_to_viewport(self) -> None:
         """Expands the scene tracking rectangle so that the scrollbars 
         always have room to move when panning into empty space."""
