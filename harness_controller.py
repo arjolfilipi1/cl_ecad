@@ -119,7 +119,7 @@ class MergeBranchPointsCommand(QUndoCommand):
     and hides the moved node while retaining its data for unmerging."""
 
     def __init__(self, controller: "HarnessController", moved_node_id: str, target_node_id: str,
-                 pre_merge_pos: tuple, target_pos: tuple, old_metadata: dict):
+                 pre_merge_pos: tuple, target_pos: tuple, old_metadata: dict,reassigned_edges: list):
         super().__init__(f"Merge {moved_node_id} into {target_node_id}")
         self.controller = controller
         self.moved_node_id = moved_node_id

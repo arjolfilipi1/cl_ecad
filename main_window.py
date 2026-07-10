@@ -115,6 +115,7 @@ class MainWindow(QMainWindow):
         """Opens the application settings dialog."""
         dialog = SettingsDialog(self)
         dialog.exec_()
+        self.view.load_settings()
     def on_open(self) -> None:
         path, _ = QFileDialog.getOpenFileName(self, "Open Harness JSON", "", "JSON Files (*.json)")
         if path:

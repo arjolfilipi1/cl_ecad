@@ -7,8 +7,8 @@
       "node_type": "connector",
       "label": "STVB 01",
       "position": [
-        0.16793341151026198,
-        -189.0505795990531
+        -29.999467056986674,
+        -180.2308549702835
       ],
       "metadata": {}
     },
@@ -67,8 +67,8 @@
       "node_type": "splice",
       "label": "Inline Joint",
       "position": [
-        99.94515150647096,
-        -185.85969831729798
+        89.05122953440872,
+        -180.69918962325758
       ],
       "metadata": {}
     },
@@ -77,8 +77,8 @@
       "node_type": "branch_point",
       "label": "BRANCH_1",
       "position": [
-        -10.0,
-        -100.0
+        -20.0,
+        -90.0
       ],
       "metadata": {}
     },
@@ -87,8 +87,8 @@
       "node_type": "branch_point",
       "label": "BRANCH_2",
       "position": [
-        31.065281578343146,
-        -190.7713869298897
+        20.0,
+        -180.0
       ],
       "metadata": {}
     },
@@ -97,18 +97,24 @@
       "node_type": "branch_point",
       "label": "BRANCH_3",
       "position": [
-        118.2886663759407,
-        -143.6101019966557
+        190.0,
+        -210.0
       ],
-      "metadata": {}
+      "metadata": {
+        "merged_into": "BRANCH_4",
+        "pre_merge_position": [
+          118.2886663759407,
+          -143.6101019966557
+        ]
+      }
     },
     {
       "node_id": "BRANCH_4",
       "node_type": "branch_point",
       "label": "BRANCH_4",
       "position": [
-        150.384442734204,
-        -160.2244716233348
+        190.0,
+        -210.0
       ],
       "metadata": {}
     }
@@ -127,7 +133,7 @@
     {
       "edge_id": "SEG_2",
       "start_node_id": "SPLICE_1",
-      "end_node_id": "BRANCH_3",
+      "end_node_id": "BRANCH_4",
       "length_mm": 43.08067551922402,
       "max_diameter_mm": 6.0,
       "bend_radius_mm": 18.0,
@@ -195,7 +201,7 @@
     },
     {
       "edge_id": "SEG_SPLIT_3",
-      "start_node_id": "BRANCH_3",
+      "start_node_id": "BRANCH_4",
       "end_node_id": "STVBF 01",
       "length_mm": 176.91932448077597,
       "max_diameter_mm": 6.0,

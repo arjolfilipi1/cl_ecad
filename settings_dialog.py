@@ -1,7 +1,7 @@
 import os
 from PyQt5.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QLabel, 
-    QLineEdit, QPushButton, QDialogButtonBox, QFileDialog
+    QLineEdit, QPushButton, QDialogButtonBox, QFileDialog,QCheckBox
 )
 from PyQt5.QtCore import QSettings
 
@@ -38,7 +38,13 @@ class SettingsDialog(QDialog):
         layout.addLayout(save_layout)
         
         layout.addStretch() # Push everything to the top
-
+        # --- Grid Toggle Setting ---
+        grid_layout = QHBoxLayout()
+        self.grid_checkbox = QCheckBox("Enable Background CAD Grid")
+        grid_layout.addWidget(self.grid_checkbox)
+        layout.addLayout(grid_layout)
+        
+        layout.addStretch()
         # --- Dialog Buttons ---
         self.button_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         self.button_box.accepted.connect(self._save_settings)
@@ -61,8 +67,11 @@ class SettingsDialog(QDialog):
         default_path = os.path.expanduser("~")
         saved_path = self.settings.value("default_save_location", default_path)
         self.path_input.setText(saved_path)
-
+        # Load grid visibility flag (defaults to True)
+        show_grid = self.settings.value("show_grid", True, type=bool)
+        self.grid_checkbox.setChecked(show_grid)
     def _save_settings(self) -> None:
         """Saves the UI values back to QSettings and closes the dialog."""
         self.settings.setValue("default_save_location", self.path_input.text())
+        self.settings.setValue("show_grid", self.grid_checkbox.isChecked())
         self.accept()

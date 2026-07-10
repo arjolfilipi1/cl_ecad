@@ -613,7 +613,8 @@ class HarnessGraphicsView(QGraphicsView):
         self.setTransformationAnchor(QGraphicsView.NoAnchor)
         self.setResizeAnchor(QGraphicsView.NoAnchor)
         self._pan_start = None
-
+        self.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
         # Load initial grid state from settings
         self.load_settings()
 
@@ -633,7 +634,7 @@ class HarnessGraphicsView(QGraphicsView):
         self._update_zoom_indicator()
     def load_settings(self) -> None:
         """Reads configuration choices from the global app registry."""
-        settings = QSettings("MyCompany", "HarnessApp")
+        settings = QSettings("Arjol", "HarnessApp")
         self.grid_enabled = settings.value("show_grid", True, type=bool)
         self.viewport().update()  # Force background repaint
     # ---- HUD Overlay Positioning ----
@@ -676,7 +677,7 @@ class HarnessGraphicsView(QGraphicsView):
         # Translate the view back to lock the cursor onto the scene point
         delta = old_scene_pos - new_scene_pos
         self.translate(-delta.x(), -delta.y())
-
+        self._expand_scene_to_viewport()
         self._update_zoom_indicator()
     # ---- load / save (no dialogs, no message boxes — that's main_window's job) ----
 
@@ -753,8 +754,10 @@ class HarnessGraphicsView(QGraphicsView):
     def mouseMoveEvent(self, event) -> None:
         """Handles background panning translation by shifting scrollbars."""
         if self._pan_start is not None:
+            print("panning")
             delta = event.pos() - self._pan_start
             self._pan_start = event.pos()
+            self._expand_scene_to_viewport()
             self.horizontalScrollBar().setValue(self.horizontalScrollBar().value() - delta.x())
             self.verticalScrollBar().setValue(self.verticalScrollBar().value() - delta.y())
             event.accept()
@@ -934,3 +937,21 @@ class HarnessGraphicsView(QGraphicsView):
             edge_item.end_item = new_node_item
             new_node_item.register_edge(edge_item)
         edge_item.update_line()
+    def _expand_scene_to_viewport(self) -> None:
+        """Expands the scene tracking rectangle so that the scrollbars 
+        always have room to move when panning into empty space."""
+        if not self.scene:
+            return
+
+        # Get the bounding box of all visual components
+        items_rect = self.scene.itemsBoundingRect()
+
+        # Get the current visible window boundaries mapped to scene coordinates
+        viewport_rect = self.mapToScene(self.viewport().rect()).boundingRect()
+
+        # Combine them so the scene is at least as large as the window + the items
+        united_rect = items_rect.united(viewport_rect)
+
+        # Add a generous padding margin (e.g., 500px) so the user can keep panning smoothly
+        padded_rect = united_rect.adjusted(-500, -500, 500, 500)
+        self.scene.setSceneRect(padded_rect)
